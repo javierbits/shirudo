@@ -702,7 +702,7 @@ can rewrite what it finds does so with ``-D patch``:
 .. code-block:: console
 
    $ spatch -D patch --sp-file testing/coccinelle/zero_init.cocci \
-         --in-place --include-headers util/string.c
+         --in-place --include-headers bpf/bpf2.c
 
 .. list-table::
    :header-rows: 1

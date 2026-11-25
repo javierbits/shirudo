@@ -216,11 +216,12 @@ Write a Lean 4 proof
    the model's own stops nanoda with ``declaration not found`` and its
    name; prove the step with ``decide``, ``omega`` or ``simp``.
 
-3. Where CBMC can, add a CBMC proof that the C computes what the model
+3. Where C remains, add a CBMC proof that it computes what the model
    computes, for every input up to a bound, as
-   :src:`testing/proofs/cbmc/string-prefix.c` does for the C prefix
-   helpers; elsewhere the model follows the implementation by review,
-   and the coverage page says so.
+   :src:`testing/proofs/cbmc/paths-bpffs-name-model.c` does for the
+   pin-name helpers in :src:`util/paths.h`. CBMC does not prove Rust.
+   Kani proofs of the Rust code are planned; until then, the model
+   follows Rust by review. The coverage page records this limit.
 
 4. Add a row to :doc:`proof-coverage`.
 
