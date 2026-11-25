@@ -1206,7 +1206,7 @@ $(FUZZ_TARGETS): $(FUZZ_HEADERS) $(FUZZ_STAMP) $(RUST_FUZZ_LIB)
 
 # The Rust targets each call the fuzz.rs entry point of one module.
 FUZZ_NAMES := kernel beefile elf tree-state image prog-metadata upatch \
-	     bpm-tar bpm-index bpm-package oci-manifest oci-http \
+	     bpm-tar bpm-index bpm-info bpm-package oci-manifest oci-http \
 	     oci-ref registry-auth config tpm-wire json tree cms eventlog otel \
 	     attest config-update decoder kconfig quote-check rodata serializer
 FUZZ_MAIN_DIR := build/fuzz-main

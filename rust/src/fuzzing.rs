@@ -8,8 +8,10 @@
 //! target's LLVMFuzzerTestOneInput() and LLVMFuzzerInitialize() call.
 
 use std::ffi::CString;
-use std::io::Write;
+use std::fs::File;
+use std::io::{Seek, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::FileExt;
 
 /// The target's entry points: `$run` of each input, and `$init` once
 /// before the first.
@@ -66,6 +68,55 @@ pub(crate) fn input_gzip_file(data: &[u8]) -> Option<InputFile> {
         return input_file(data);
     }
     input_file(&crate::util::gzip::gzip(data).ok()?)
+}
+
+/// A memfd captures both stdio and direct writes to stdout.
+pub(crate) struct StdoutCapture(File);
+
+impl StdoutCapture {
+    pub(crate) fn new() -> Self {
+        let file = File::from(input_file(&[]).expect("create capture file").fd);
+        // SAFETY: the open memfd becomes stdout in this fuzz process.
+        let fd = unsafe { libc::dup2(file.as_raw_fd(), libc::STDOUT_FILENO) };
+        assert_eq!(fd, libc::STDOUT_FILENO);
+        Self(file)
+    }
+
+    fn take(&self) -> Vec<u8> {
+        // SAFETY: flush libc's buffered writes before reading the memfd.
+        assert_eq!(unsafe { libc::fflush(core::ptr::null_mut()) }, 0);
+        let mut file = &self.0;
+        let size = file.metadata().expect("stat captured stdout").len();
+        let mut bytes = vec![0; usize::try_from(size).expect("captured stdout size")];
+
+        file.read_exact_at(&mut bytes, 0)
+            .expect("read captured stdout");
+        file.set_len(0).expect("clear captured stdout");
+        file.rewind().expect("rewind captured stdout");
+        bytes
+    }
+
+    pub(crate) fn check(&self, json: bool) {
+        let output = self.take();
+        if json {
+            if !output.is_empty() {
+                let document = output.strip_suffix(b"\n").expect("JSON without line feed");
+                assert!(crate::util::json::parse_schema(document, &[], &mut ()).is_ok());
+            }
+            return;
+        }
+
+        let text = core::str::from_utf8(&output).expect("stdout is not UTF-8");
+        let mut chars = text.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            assert!(
+                !c.is_control()
+                    || matches!(c, '\t' | '\n')
+                    || (c == '\r' && chars.peek() == Some(&'\n'))
+            );
+        }
+    }
 }
 
 unsafe extern "C" {

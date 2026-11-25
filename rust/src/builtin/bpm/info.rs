@@ -196,3 +196,6 @@ pub(super) fn data(source: &[u8], member: &[u8], json: bool) -> Result {
         }
     }
 }
+
+#[cfg(shirudo_fuzz)]
+mod fuzz;
