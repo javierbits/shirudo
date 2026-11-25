@@ -13,11 +13,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
 use super::build::{self, Override, cstring};
+use super::download::{Download, digest_ok};
 use super::{archive, error, path};
 use crate::errno::{EACCES, EINVAL, EIO, EKEYREJECTED, ENAMETOOLONG, ENOENT, ENOTDIR};
 use crate::heap::xfree;
 use crate::shirudo_build::{KeyFiles, check_keys, package};
-use crate::util::bpm_oci::{Client, MANIFEST_MEDIA, digest_matches, manifest_layers, sha256_hex};
 use crate::util::bpm_package::{PackageInfo, load_info, read_member_in, semver_compare};
 use crate::util::help::{Help, HelpSection};
 use crate::util::options::{
@@ -25,7 +25,6 @@ use crate::util::options::{
 };
 use crate::util::upatch;
 
-const PACKAGE_MEDIA: &CStr = c"application/vnd.shirudo.bpm.package.v1+gzip";
 const PATH_MAX: usize = 4096;
 
 /// A package's identity, its certificate freed when it goes.
@@ -110,74 +109,6 @@ fn copy_member(package: &CStr, member: &[u8], output: &[u8]) -> Result<(), c_int
         .map_err(|e| -e.raw_os_error().unwrap_or(EIO))
 }
 
-/// A base package downloaded into a file of /tmp, private to this
-/// command and removed when this goes, whatever the update made of it.
-struct Download(Vec<u8>);
-
-impl Drop for Download {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(path(&self.0));
-    }
-}
-
-/// The package an `oci://` reference names, into a temporary file,
-/// checked against the digest its manifest gives: the package of the
-/// manifest whose digest the operator named, `want`.
-fn download(reference: &[u8], want: &[u8]) -> Result<Download, c_int> {
-    let mut c = Client::new();
-    let (repo, tag) = c.parse_pull_ref(reference)?;
-    let url = c.url(&repo, b"manifests", &tag)?;
-    let manifest = c.get(&url, MANIFEST_MEDIA, false)?;
-    let mut hex = [0u8; 65];
-    if sha256_hex(manifest.bytes(), &mut hex) != 0 {
-        return Err(-EINVAL);
-    }
-    let served = crate::text::cstr(&hex);
-    if !digest_matches(want, served) {
-        error(
-            format!(
-                "bpm config update: {} serves manifest sha256:{}, not {}",
-                String::from_utf8_lossy(reference),
-                String::from_utf8_lossy(served),
-                String::from_utf8_lossy(want)
-            )
-            .as_bytes(),
-        );
-        return Err(-EKEYREJECTED);
-    }
-    let (layers, _) = manifest_layers(manifest.bytes(), 8, false)?;
-    let Some(layer) = layers
-        .iter()
-        .find(|l| l.media() == PACKAGE_MEDIA.to_bytes())
-    else {
-        return Err(-ENOENT);
-    };
-    let url = c.url(&repo, b"blobs", layer.digest())?;
-    let mut tmpl = *b"/tmp/shirudo-bpm-base-XXXXXX\0";
-    // SAFETY: the template, which mkstemp() fills in.
-    let fd = unsafe { crate::sys::libc::mkstemp(tmpl.as_mut_ptr().cast()) };
-    if fd < 0 {
-        return Err(super::last_err());
-    }
-    let tmp = Download(crate::text::cstr(&tmpl).to_vec());
-    let transferred = c.get_file(&url, PACKAGE_MEDIA, fd, layer.size());
-    // SAFETY: mkstemp returned this descriptor, which is closed once.
-    let closed = unsafe { crate::sys::libc::close(fd) };
-    let closed = if closed == 0 {
-        Ok(())
-    } else {
-        Err(super::last_err())
-    };
-    transferred.and(closed)?;
-    let body = archive::read_file(&tmp.0, archive::MAX_FILE)?;
-    let mut hex = [0u8; 65];
-    if sha256_hex(&body, &mut hex) != 0 || !digest_matches(layer.digest(), crate::text::cstr(&hex))
-    {
-        return Err(-EKEYREJECTED);
-    }
-    Ok(tmp)
-}
-
 /// `bpm config update`, from `update` on.
 const CONFIG_UPDATE_FILE: c_int = 0;
 const CONFIG_UPDATE_BASE_PACKAGE: c_int = 1;
@@ -246,13 +177,6 @@ static CONFIG_UPDATE_HELP: Help = Help::new(
     &CONFIG_UPDATE_SECTIONS,
     None,
 );
-
-/// Whether `digest` is sha256:<64 lowercase hex>.
-fn digest_ok(digest: &[u8]) -> bool {
-    digest.strip_prefix(b"sha256:").is_some_and(|hex| {
-        hex.len() == 64 && hex.iter().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
-    })
-}
 
 /// `bpm config update`, from `update` on: 0, EXIT_USAGE, or -errno.
 pub(super) fn run(args: &[&CStr]) -> c_int {
@@ -325,10 +249,15 @@ pub(super) fn run(args: &[&CStr]) -> c_int {
     let download_guard;
     let local_path;
     let package = match base_digest {
-        Some(want) => match download(base.to_bytes(), want.to_bytes()) {
+        Some(want) => match Download::fetch(
+            b"bpm config update",
+            base.to_bytes(),
+            want.to_bytes(),
+            c"/tmp/shirudo-bpm-base-XXXXXX",
+        ) {
             Ok(p) => {
                 download_guard = p;
-                &download_guard.0
+                download_guard.path().to_bytes()
             }
             Err(err) => return err,
         },

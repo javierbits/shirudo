@@ -15,6 +15,7 @@ use core::ffi::{CStr, c_int};
 use super::beefile::{MAX_ENTRIES, MAX_FIXES, Spec, Upatch as BuildUpatch, fix_id_ok, parse};
 use super::build::cstring;
 use super::config_update::Info;
+use super::download::{Download, digest_ok};
 use super::publish::{
     EMPTY_CONFIG_MEDIA, MANIFEST_CAP, emit_descriptor, fail, push_blob, put_manifest, sign_detached,
 };
@@ -60,8 +61,9 @@ const APPEND_TREE_ID: c_int = 4;
 const APPEND_REFERENCE: c_int = 5;
 const APPEND_OP: c_int = 6;
 const APPEND_SEGMENT_OPS: c_int = 7;
+const APPEND_PACKAGE_DIGEST: c_int = 8;
 
-static APPEND_OPTS: [OptSpec; 8] = [
+static APPEND_OPTS: [OptSpec; 9] = [
     OptSpec::new(
         c"--keys-dir",
         0,
@@ -118,16 +120,25 @@ static APPEND_OPTS: [OptSpec; 8] = [
         Some(c"<n>"),
         c"seal a segment holding n operations and start the next, 1 to 512 (default 64)",
     ),
+    OptSpec::new(
+        c"--package-digest",
+        0,
+        0,
+        Some(c"<sha256:hex>"),
+        c"the manifest digest of an oci:// package",
+    ),
 ];
 
 static APPEND_SECTIONS: [HelpSection; 1] = [HelpSection::options(c"options:", &APPEND_OPTS)];
 
 static APPEND_HELP: Help = Help::new(
-    c"shirudo bpm tree append <package-file> <repository> [options]",
+    c"shirudo bpm tree append <package-file|oci://host/repo:tag> <repository> [options]",
     Some(
         c"Publish the [upatches.tree] entries of a built package as the next\n\
           operations of the signed tree at <repository>:<ref>. The key defaults to\n\
-          --keys-dir, SHIRUDO_KEYS_DIR or /var/lib/shirudo/keys.",
+          --keys-dir, SHIRUDO_KEYS_DIR or /var/lib/shirudo/keys. An oci:// package needs \
+          --package-digest,\n\
+          the digest of its manifest.",
     ),
     &APPEND_SECTIONS,
     None,
@@ -574,6 +585,8 @@ fn read_fixes(document: &[u8], p: &TreePublication) -> Result<Vec<Vec<Vec<u8>>>,
 /// One bpm tree append, filled in by its steps in turn.
 struct Append<'a> {
     package: &'a CStr,
+    package_digest: Option<&'a [u8]>,
+    download: Option<Download>,
     raw_repository: &'a CStr,
     keys_dir_arg: Option<&'a CStr>,
     key: Option<std::ffi::CString>,
@@ -614,6 +627,8 @@ fn parse_options<'a>(args: &'a [&'a CStr]) -> Result<Append<'a>, c_int> {
     );
     let mut a = Append {
         package: c"",
+        package_digest: None,
+        download: None,
         raw_repository: c"",
         keys_dir_arg: None,
         key: None,
@@ -669,6 +684,20 @@ fn parse_options<'a>(args: &'a [&'a CStr]) -> Result<Append<'a>, c_int> {
                 Ok(n) => a.segment_ops = n as i64,
                 Err(_) => return Err(EXIT_USAGE),
             },
+            APPEND_PACKAGE_DIGEST => {
+                if !digest_ok(bytes) {
+                    p.usage(
+                        &[
+                            b"--package-digest ",
+                            bytes,
+                            b" is not sha256:<64 lowercase hex>",
+                        ]
+                        .concat(),
+                    );
+                    return Err(EXIT_USAGE);
+                }
+                a.package_digest = Some(bytes);
+            }
             OPT_ARG => {
                 if raw_repository.is_some() {
                     p.usage_arg(b"unexpected argument ");
@@ -688,6 +717,10 @@ fn parse_options<'a>(args: &'a [&'a CStr]) -> Result<Append<'a>, c_int> {
         p.usage(b"takes <package-file> and <repository>");
         return Err(EXIT_USAGE);
     };
+    if package.to_bytes().starts_with(b"oci://") != a.package_digest.is_some() {
+        p.usage(b"--package-digest names the manifest of an oci:// package, and one needs it");
+        return Err(EXIT_USAGE);
+    }
     a.package = package;
     a.raw_repository = raw_repository;
     Ok(a)
@@ -735,11 +768,33 @@ impl Append<'_> {
         Ok(())
     }
 
+    fn fetch_package(&mut self) -> Result<(), c_int> {
+        if let Some(digest) = self.package_digest {
+            self.download = Some(Download::fetch(
+                b"bpm tree append",
+                self.package.to_bytes(),
+                digest,
+                c"/tmp/shirudo-bpm-append-XXXXXX",
+            )?);
+        }
+        Ok(())
+    }
+
+    fn package_file(&self) -> &CStr {
+        self.download.as_ref().map_or(self.package, Download::path)
+    }
+
     fn read_package(&mut self) -> Result<(), c_int> {
-        self.info = Some(Info::load(self.package)?);
+        self.info = Some(Info::load(self.package_file())?);
         let mut dir = [0u8; 101];
-        let beefile = read_member_in(self.package, b"Beefile", None, Some(&mut dir), BEEFILE_MAX)
-            .inspect_err(|_| {
+        let beefile = read_member_in(
+            self.package_file(),
+            b"Beefile",
+            None,
+            Some(&mut dir),
+            BEEFILE_MAX,
+        )
+        .inspect_err(|_| {
             err(format!(
                 "bpm tree append: package {} does not include Beefile",
                 lossy(self.package.to_bytes())
@@ -1039,7 +1094,7 @@ impl Append<'_> {
             &u.tree.load_artifact
         };
         let member_data = read_member_in(
-            self.package,
+            self.package_file(),
             member,
             Some(&self.package_dir),
             None,
@@ -1138,6 +1193,7 @@ impl Append<'_> {
     fn run(&mut self) -> Result<(), c_int> {
         self.signing_keys()?;
         self.trim_repository()?;
+        self.fetch_package()?;
         self.read_package()?;
         self.head()?;
         self.carry_fixes()?;

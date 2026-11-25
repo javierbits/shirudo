@@ -10,6 +10,7 @@ mod archive;
 mod beefile;
 mod build;
 mod config_update;
+mod download;
 mod publish;
 mod show;
 mod tree;
