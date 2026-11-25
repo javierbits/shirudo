@@ -82,6 +82,7 @@ int upatch_pins_read(const char *name, struct upatch_pins *out)
 {
 	char dir[PATH_MAX];
 	struct dirent *e;
+	int ret = 0;
 	DIR *d;
 
 	memset(out, 0, sizeof(*out));
@@ -90,10 +91,15 @@ int upatch_pins_read(const char *name, struct upatch_pins *out)
 	d = opendir(dir);
 	if (!d)
 		return -errno;
-	while ((e = readdir(d)))
+	errno = 0;
+	while ((e = readdir(d))) {
 		upatch_pins_note(out, e->d_name);
+		errno = 0;
+	}
+	if (errno)
+		ret = -errno;
 	closedir(d);
-	return 0;
+	return ret;
 }
 
 bool upatch_loaded_pins(const char *name)
@@ -117,6 +123,7 @@ int upatch_each_link(const char *name,
 	d = opendir(dir);
 	if (!d)
 		return -errno;
+	errno = 0;
 	while (!ret && (e = readdir(d))) {
 		__u32 index;
 
@@ -126,7 +133,10 @@ int upatch_each_link(const char *name,
 			ret = -ENAMETOOLONG;
 		else
 			ret = cb(index, pin, ctx);
+		errno = 0;
 	}
+	if (!e && errno && !ret)
+		ret = -errno;
 	closedir(d);
 	return ret;
 }
@@ -192,6 +202,7 @@ int upatch_each_pinned(int (*cb)(const char *name, void *ctx), void *ctx)
 	d = opendir(BPFFS_UPATCHES_DIR);
 	if (!d)
 		return errno == ENOENT ? 0 : -errno;
+	errno = 0;
 	while (!ret && (e = readdir(d))) {
 		char name[UPATCH_NAME_MAX + 1];
 
@@ -199,7 +210,10 @@ int upatch_each_pinned(int (*cb)(const char *name, void *ctx), void *ctx)
 		    upatch_name_from_bpffs(name, sizeof(name), e->d_name))
 			continue;
 		ret = cb(name, ctx);
+		errno = 0;
 	}
+	if (!e && errno && !ret)
+		ret = -errno;
 	closedir(d);
 	return ret;
 }

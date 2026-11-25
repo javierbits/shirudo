@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: BSD-2-Clause
 /* Copyright (c) 2026 Authors of shirudo */
 
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <string.h>
 #include <unistd.h>
@@ -9,6 +11,49 @@
 #include "paths.h"
 #include "unit.h"
 #include "upatch_pins.h"
+
+/*
+ * readdir() fails only when the kernel or the libc makes it fail, which a
+ * test cannot ask for, so these count the reads down and report EIO for the
+ * one after the last, as a read that fails partway through does. opendir()
+ * opens the directory of the case, because the pin path that the readers
+ * resolve is not a directory the test may write. The readers call
+ * readdir64, which readdir is with _FILE_OFFSET_BITS=64.
+ */
+static const char *test_dir;
+static int reads_left = -1;
+
+DIR *__real_opendir(const char *path);
+DIR *__wrap_opendir(const char *path);
+DIR *__wrap_opendir(const char *path)
+{
+	return __real_opendir(test_dir ? test_dir : path);
+}
+
+struct dirent *__real_readdir64(DIR *d);
+struct dirent *__wrap_readdir64(DIR *d);
+struct dirent *__wrap_readdir64(DIR *d)
+{
+	if (reads_left == 0) {
+		errno = EIO;
+		return NULL;
+	}
+	if (reads_left > 0)
+		reads_left--;
+	return __real_readdir64(d);
+}
+
+static void read_entries_of(const char *dir, int reads)
+{
+	test_dir = dir;
+	reads_left = reads;
+}
+
+static void read_entries_of_no_dir(void)
+{
+	test_dir = NULL;
+	reads_left = -1;
+}
 
 static void names_are_parsed_strictly(void)
 {
@@ -164,6 +209,82 @@ static void no_pin_directory_is_no_upatch(void)
 	EXPECT_EQ(seen, 0);
 }
 
+static int count_link(__u32 index, const char *pin, void *ctx)
+{
+	(*(int *)ctx)++;
+	return 0;
+}
+
+static void make_entry(const char *dir, const char *name)
+{
+	char path[PATH_MAX];
+	int fd;
+
+	ASSERT_EQ(path_join(path, sizeof(path), dir, name), 0);
+	fd = open(path, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+	ASSERT_TRUE(fd >= 0);
+	close(fd);
+}
+
+static void drop_entry(const char *dir, const char *name)
+{
+	char path[PATH_MAX];
+
+	ASSERT_EQ(path_join(path, sizeof(path), dir, name), 0);
+	ASSERT_EQ(unlink(path), 0);
+}
+
+static void pin_entries_are_walked(void)
+{
+	char dir[] = "/tmp/shirudo-unit-pins-XXXXXX";
+	static const char * const entries[] = { "link_0", "link_2", "alpha" };
+	struct upatch_pins pins = {};
+	size_t i;
+	int seen = 0;
+
+	ASSERT_TRUE(mkdtemp(dir));
+	for (i = 0; i < ARRAY_SIZE(entries); i++)
+		make_entry(dir, entries[i]);
+
+	read_entries_of(dir, -1);
+	EXPECT_EQ(upatch_pins_read("shirudo-unit-pins", &pins), 0);
+	EXPECT_UEQ(pins.nr_links, 2);
+	EXPECT_UEQ(pins.first_link, 0);
+	EXPECT_UEQ(pins.last_link, 2);
+	EXPECT_EQ(upatch_each_link("shirudo-unit-pins", count_link, &seen), 0);
+	EXPECT_UEQ(seen, 2);
+	seen = 0;
+	EXPECT_EQ(upatch_each_pinned(count_pinned, &seen), 0);
+	EXPECT_UEQ(seen, ARRAY_SIZE(entries));
+	read_entries_of_no_dir();
+
+	for (i = 0; i < ARRAY_SIZE(entries); i++)
+		drop_entry(dir, entries[i]);
+	ASSERT_EQ(rmdir(dir), 0);
+}
+
+static void a_failed_readdir_is_an_error(void)
+{
+	char dir[] = "/tmp/shirudo-unit-pins-XXXXXX";
+	struct upatch_pins pins = {};
+	int seen = 0;
+
+	ASSERT_TRUE(mkdtemp(dir));
+	/* Read the "." and ".." of the empty directory, then fail. */
+	read_entries_of(dir, 2);
+	EXPECT_EQ(upatch_pins_read("shirudo-unit-pins", &pins), -EIO);
+	EXPECT_UEQ(pins.nr_links, 0);
+	reads_left = 2;
+	EXPECT_EQ(upatch_each_link("shirudo-unit-pins", count_link, &seen),
+		  -EIO);
+	EXPECT_UEQ(seen, 0);
+	reads_left = 2;
+	EXPECT_EQ(upatch_each_pinned(count_pinned, &seen), -EIO);
+	EXPECT_UEQ(seen, 0);
+	read_entries_of_no_dir();
+	ASSERT_EQ(rmdir(dir), 0);
+}
+
 static const struct unit_case cases[] = {
 	UNIT_CASE(names_are_parsed_strictly),
 	UNIT_CASE(lowest_index_is_kept_in_any_order),
@@ -175,6 +296,8 @@ static const struct unit_case cases[] = {
 	UNIT_CASE(link_pins_read_back_as_links),
 	UNIT_CASE(payload_of_absent_upatch_is_enoent),
 	UNIT_CASE(no_pin_directory_is_no_upatch),
+	UNIT_CASE(pin_entries_are_walked),
+	UNIT_CASE(a_failed_readdir_is_an_error),
 	{}
 };
 

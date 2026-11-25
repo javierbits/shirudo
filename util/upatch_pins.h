@@ -40,7 +40,8 @@ bool upatch_loaded_pins(const char *name);
 
 /*
  * Calls cb for each link_<n> pin, in directory order, and stops at the
- * first nonzero return, which it returns.
+ * first nonzero return, which it returns; -errno when a read of the
+ * directory fails.
  */
 int upatch_each_link(const char *name,
 		     int (*cb)(__u32 index, const char *pin, void *ctx),
