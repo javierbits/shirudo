@@ -10,6 +10,7 @@
 mod bpm;
 mod compile;
 mod image;
+mod jar;
 mod package;
 mod sign;
 mod skeleton;
@@ -27,7 +28,7 @@ use crate::util::help::{Help, HelpSection};
 use crate::util::hex::decode;
 use crate::util::options::{EXIT_USAGE, OPT_ARG, OPT_DONE, OPT_END, OptParser, OptSpec};
 use crate::util::paths::{key_file, key_files, keys_dir};
-use crate::util::upatch::Upatch;
+use crate::util::upatch::{TYPE_JAVA, Upatch};
 
 const SIGNING_KEY_PATH: &CStr = c"/var/lib/shirudo/keys/signing_key.pem";
 const CERT_PATH: &CStr = c"/var/lib/shirudo/keys/cert.der";
@@ -88,14 +89,15 @@ const BUILD_VMLINUX: c_int = 5;
 const BUILD_EXTRA_CFLAGS: c_int = 6;
 const BUILD_UNLOAD: c_int = 7;
 const BUILD_PAYLOAD_SHA256: c_int = 8;
-const BUILD_EMIT_ARTIFACTS: c_int = 9;
+const BUILD_JAVA: c_int = 9;
+const BUILD_EMIT_ARTIFACTS: c_int = 10;
 
 const VMLINUX_HELP: &CStr = ffi::c_splice!(
     "compile against it instead of ./vmlinux.h, ./vendor/linux/vmlinux.h or ",
     compile::VMLINUX_PATH
 );
 
-static BUILD_OPTS: [OptSpec; 10] = [
+static BUILD_OPTS: [OptSpec; 11] = [
     OptSpec::new(
         c"--output",
         b'o',
@@ -154,6 +156,13 @@ static BUILD_OPTS: [OptSpec; 10] = [
         c"with --unload, the payload digest, which the archive /var/lib/shirudo/upatches/<name>.upatch gives otherwise",
     ),
     OptSpec::new(
+        c"--java",
+        0,
+        0,
+        None,
+        c"with --unload and --payload-sha256, sign the directive of a Java upatch, which the archive tells otherwise",
+    ),
+    OptSpec::new(
         c"--emit-artifacts",
         0,
         0,
@@ -165,12 +174,12 @@ static BUILD_OPTS: [OptSpec; 10] = [
 static BUILD_SECTIONS: [HelpSection; 1] = [HelpSection::options(c"options:", &BUILD_OPTS)];
 
 static BUILD_HELP: Help = Help::new(
-    c"shirudo build <input.bpf.c|.bpf.o> [-o <output.upatch>] [options]\n       \
+    c"shirudo build <input.bpf.c|.bpf.o|.jar> [-o <output.upatch>] [options]\n       \
       shirudo build --unload <upatch-name> [-o <output.upatch>] [options]",
     Some(
-        c"Compile a .bpf.c, or take a .bpf.o, and sign it into a .upatch, or sign\n\
-          the UNLOAD directive of a loaded upatch. foo/bar.bpf.c becomes\n\
-          foo/bar.bpf.upatch.",
+        c"Compile a .bpf.c, or take a .bpf.o or a Java agent .jar, and sign it into\n\
+          a .upatch, or sign the UNLOAD directive of a loaded upatch.\n\
+          foo/bar.bpf.c becomes foo/bar.bpf.upatch, foo/agent.jar foo/agent.upatch.",
     ),
     &BUILD_SECTIONS,
     Some(
@@ -198,6 +207,8 @@ fn derive_output(input: &CStr) -> Result<CString, c_int> {
     let s = input.to_bytes();
     let stem = if has_suffix(input, c".c") || has_suffix(input, c".o") {
         &s[..s.len() - 2]
+    } else if has_suffix(input, c".jar") {
+        &s[..s.len() - 4]
     } else {
         s
     };
@@ -376,6 +387,7 @@ fn path(p: &[u8]) -> &std::ffi::OsStr {
 struct Opts<'a> {
     output: Option<&'a CStr>,
     name: Option<&'a CStr>,
+    java: bool,
     keys_dir: Option<&'a CStr>,
     pkey: Option<&'a CStr>,
     cert: Option<&'a CStr>,
@@ -391,14 +403,14 @@ struct Opts<'a> {
 /// else the loaded payload's as the operator's local archive records it,
 /// since the target refuses a directive whose digest is not that.
 /// None when the digest given is no 64 hex digits, a usage error.
-fn unload_digest(name: &CStr, given: Option<&CStr>) -> Result<[u8; 32], Option<c_int>> {
+fn unload_digest(name: &CStr, given: Option<&CStr>) -> Result<([u8; 32], bool), Option<c_int>> {
     let mut digest = [0u8; 32];
 
     if let Some(hex) = given {
         if decode(hex.to_bytes(), &mut digest).is_err() {
             return Err(None);
         }
-        return Ok(digest);
+        return Ok((digest, false));
     }
     let archive = [UPATCHES_DIR.as_bytes(), b"/", name.to_bytes(), b".upatch"].concat();
     if archive.len() >= PATH_MAX {
@@ -417,15 +429,16 @@ fn unload_digest(name: &CStr, given: Option<&CStr>) -> Result<[u8; 32], Option<c
         );
         return Err(Some(2));
     };
+    let java = u.hdr.ty == TYPE_JAVA;
     digest = u.hdr.payload_sha256;
     drop(u);
     info(&[b"--payload-sha256 derived from archive ", path.to_bytes()].concat());
-    Ok(digest)
+    Ok((digest, java))
 }
 
 fn unload(p: &OptParser<'_>, o: &Opts, name: &CStr, pkey: &CStr, cert: &CStr) -> c_int {
-    let digest = match unload_digest(name, o.payload_sha256) {
-        Ok(d) => d,
+    let (digest, inferred_java) = match unload_digest(name, o.payload_sha256) {
+        Ok(found) => found,
         Err(None) => {
             p.usage(b"--payload-sha256 must be 64 hex characters");
             return EXIT_USAGE;
@@ -447,7 +460,7 @@ fn unload(p: &OptParser<'_>, o: &Opts, name: &CStr, pkey: &CStr, cert: &CStr) ->
             &derived
         }
     };
-    let ret = package::unload_directive(name, &digest, output, pkey, cert);
+    let ret = package::unload_directive(name, &digest, output, pkey, cert, o.java || inferred_java);
     if ret.is_ok() && o.emit_artifacts {
         let text = [
             b"emitted:\n  upatch: ",
@@ -486,6 +499,31 @@ fn load(o: &Opts, input: &CStr, pkey: &CStr, cert: &CStr) -> c_int {
             &derived
         }
     };
+    let derived_name;
+    let name = match o.name {
+        Some(n) => n,
+        None => {
+            derived_name = match bpm::upatch_name(input.to_bytes()) {
+                Ok(n) => CString::new(n).unwrap_or_default(),
+                Err(_) => {
+                    error(&[b"upatch name from ", input.to_bytes(), b" too long"].concat());
+                    return 2;
+                }
+            };
+            &derived_name
+        }
+    };
+    if has_suffix(input, c".jar") {
+        let ret = package::java_load(input, output, name, (pkey, cert));
+        if ret.is_ok() && o.emit_artifacts {
+            print(
+                true,
+                &[b"emitted:\n  upatch: ", output.to_bytes(), b"\n"].concat(),
+            );
+        }
+        return c_int::from(ret.is_err());
+    }
+
     let mut temp = None;
     let artifact;
     let mut emitted = None;
@@ -551,22 +589,8 @@ fn load(o: &Opts, input: &CStr, pkey: &CStr, cert: &CStr) -> c_int {
     } else if has_suffix(input, c".o") {
         (input, None)
     } else {
-        error(b"input must be .bpf.c or .bpf.o");
+        error(b"input must be .bpf.c, .bpf.o or .jar");
         return 2;
-    };
-    let derived_name;
-    let name = match o.name {
-        Some(n) => n,
-        None => {
-            derived_name = match bpm::upatch_name(input.to_bytes()) {
-                Ok(n) => CString::new(n).unwrap_or_default(),
-                Err(_) => {
-                    error(&[b"upatch name from ", input.to_bytes(), b" too long"].concat());
-                    return 2;
-                }
-            };
-            &derived_name
-        }
     };
     let ret = package::load_object(bpf_o, src, output, name, pkey, cert);
     drop(temp);
@@ -624,6 +648,7 @@ fn run(args: &[&CStr]) -> c_int {
             BUILD_EXTRA_CFLAGS => o.extra_cflags = value,
             BUILD_UNLOAD => o.unload = value,
             BUILD_PAYLOAD_SHA256 => o.payload_sha256 = value,
+            BUILD_JAVA => o.java = true,
             BUILD_EMIT_ARTIFACTS => o.emit_artifacts = true,
             OPT_ARG => {
                 if o.input.is_some() {
@@ -641,7 +666,11 @@ fn run(args: &[&CStr]) -> c_int {
         return EXIT_USAGE;
     }
     if o.unload.is_none() && o.input.is_none() {
-        p.usage(b"takes <input.bpf.c|.bpf.o> or --unload <upatch-name>");
+        p.usage(b"takes <input.bpf.c|.bpf.o|.jar> or --unload <upatch-name>");
+        return EXIT_USAGE;
+    }
+    if o.java && (o.unload.is_none() || o.payload_sha256.is_none()) {
+        p.usage(b"--java takes --unload and --payload-sha256");
         return EXIT_USAGE;
     }
 

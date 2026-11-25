@@ -341,7 +341,7 @@ pub(super) fn validate(spec: &Spec, allow_missing_upatch_source: bool) -> Result
 }
 
 /// The upatch name of a source or object path: its file name without
-/// .bpf.c, .bpf.o or .o.
+/// .bpf.c, .bpf.o, .o or .jar.
 pub(crate) fn upatch_name(source: &[u8]) -> Result<Vec<u8>, c_int> {
     let base = source
         .iter()
@@ -354,6 +354,8 @@ pub(crate) fn upatch_name(source: &[u8]) -> Result<Vec<u8>, c_int> {
         6
     } else if name_has_suffix(base, b".o") {
         2
+    } else if name_has_suffix(base, b".jar") {
+        4
     } else {
         0
     };

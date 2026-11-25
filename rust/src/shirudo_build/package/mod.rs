@@ -22,7 +22,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use super::{KeyFiles, error, info, strerr};
 use crate::bpf::object::{self, GenOpts, Object};
-use crate::errno::{E2BIG, EBADMSG, EINVAL, EIO, ENAMETOOLONG, ENOENT, EOVERFLOW};
+use crate::errno::{
+    E2BIG, EBADMSG, EFBIG, EINVAL, EIO, ENAMETOOLONG, ENOENT, EOPNOTSUPP, EOVERFLOW,
+};
 use crate::util::bpm_package::verify_cms;
 use crate::util::crypto_openssl::sha256;
 use crate::util::help::{Help, HelpSection, print_help};
@@ -30,9 +32,9 @@ use crate::util::options::{EXIT_USAGE, OPT_ARG, OPT_DONE, OPT_END, OptParser, Op
 use crate::util::upatch::{
     self, DIRECTIVE_UNLOAD, FILE_MAX, HEADER_SIZE, MAGIC, MAPS_MAX, NAME_MAX, PAYLOAD_HASH_LEN,
     POLICY_LABEL_ENTRY, POLICY_LABEL_HEADER, POLICY_LABELS_MAGIC, POLICY_LABELS_VERSION,
-    SECTION_ATTACH, SECTION_DECODERS, SECTION_NAME, SECTION_POLICY_LABELS, SECTION_UNLOAD,
-    SIGNED_SECTION, SIGNED_SECTIONS_MAX, SIGNED_TRAILER, SIGNED_TRAILER_MAGIC, SIGNED_VERSION,
-    TYPE_BPF, Upatch, VERSION,
+    SECTION_ATTACH, SECTION_DECODERS, SECTION_JAR, SECTION_NAME, SECTION_POLICY_LABELS,
+    SECTION_TYPE, SECTION_UNLOAD, SIGNED_SECTION, SIGNED_SECTIONS_MAX, SIGNED_TRAILER,
+    SIGNED_TRAILER_MAGIC, SIGNED_VERSION, TYPE_BPF, TYPE_JAVA, Upatch, VERSION,
 };
 use crate::util::upatch_rodata::{self, RodataRange};
 
@@ -711,6 +713,172 @@ fn finalize(mut obj: Object, out: &CStr, c: &Contents, keys: (&CStr, &CStr)) -> 
     Ok(())
 }
 
+/// A Java upatch has no loader: its data is the signed sections alone,
+/// NAME and PTYP, then the jar of a load or the digest an unload expects.
+/// The target verifies the signature over that data in userspace.
+fn finalize_java(
+    out: &CStr,
+    name: &CStr,
+    flags: u32,
+    payload: Section<'_>,
+    keys: (&CStr, &CStr),
+) -> Result<(), c_int> {
+    let n = name.to_bytes();
+    if n.len() >= NAME_MAX {
+        return Err(-ENAMETOOLONG);
+    }
+    let mut signed_name = [0u8; NAME_MAX];
+    signed_name[..n.len()].copy_from_slice(n);
+    let ty = TYPE_JAVA.to_le_bytes();
+    let sections = [
+        Section(SECTION_NAME, &signed_name),
+        Section(SECTION_TYPE, &ty),
+        payload,
+    ];
+    let signed = compose_signed_data(&[], &sections)?;
+    let (sig, digest) = match sign(&[], &signed, keys) {
+        Ok(s) => s,
+        Err(err) => {
+            error(format!("cms_sign: {err}").as_bytes());
+            return Err(err);
+        }
+    };
+    let data_off = HEADER_SIZE.checked_add(sig.len()).ok_or(-E2BIG)?;
+    if data_off > FILE_MAX || signed.len() > FILE_MAX - data_off {
+        error(
+            format!(
+                "{}: the jar and its signature do not fit a upatch of {FILE_MAX} bytes",
+                String::from_utf8_lossy(n)
+            )
+            .as_bytes(),
+        );
+        return Err(-E2BIG);
+    }
+    let hdr = Header {
+        name: n,
+        ty: TYPE_JAVA,
+        flags,
+        payload_sha256: &digest,
+        loader: (0, 0),
+        signature: (HEADER_SIZE as u32, sig.len() as u32),
+        metadata: (0, 0),
+        data: (data_off as u32, signed.len() as u32),
+        log_buf_sz: 0,
+        rodata_data_off: 0,
+        nr_maps: 0,
+        nr_progs: 0,
+    };
+    let out_path = super::path(out.to_bytes());
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(out_path);
+    let mut file = match file {
+        Ok(f) => f,
+        Err(e) => {
+            let err = errno_of(&e);
+            error(&[b"open ", out.to_bytes(), b": ", strerr(-err)].concat());
+            return Err(err);
+        }
+    };
+    let written = [&hdr.bytes()[..], &sig, &signed]
+        .iter()
+        .try_for_each(|b| file.write_all(b))
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(out_path);
+        return Err(errno_of(&e));
+    }
+    let directive = if flags & DIRECTIVE_UNLOAD != 0 {
+        " UNLOAD"
+    } else {
+        ""
+    };
+    info(
+        format!(
+            "wrote {} (java sig={} data={} name={}{directive})",
+            String::from_utf8_lossy(out.to_bytes()),
+            sig.len(),
+            signed.len(),
+            String::from_utf8_lossy(n),
+        )
+        .as_bytes(),
+    );
+    Ok(())
+}
+
+/// Refused where the operator sees it: a jar without Premain-Class stops
+/// every JVM that receives it as `-javaagent`.
+fn check_agent_jar(path: &CStr, jar: &[u8]) -> Result<(), c_int> {
+    let err = match super::jar::premain_class(jar) {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
+    let p = path.to_bytes();
+    if err == -ENOENT {
+        error(
+            &[
+                p,
+                b" has no Premain-Class in its manifest: a JVM does not start with it as -javaagent",
+            ]
+            .concat(),
+        );
+    } else if err == -EOPNOTSUPP {
+        error(
+            &[
+                p,
+                b": a zip64 jar or a manifest neither stored nor deflated is not supported",
+            ]
+            .concat(),
+        );
+    } else if err == -EFBIG {
+        error(&[p, b": the manifest is too large"].concat());
+    } else {
+        error(&[p, b" is not a jar"].concat());
+    }
+    Err(err)
+}
+
+/// Packages a Java agent jar as upatch `name` at `out`.
+pub(super) fn java_load(
+    jar_path: &CStr,
+    out: &CStr,
+    name: &CStr,
+    keys: (&CStr, &CStr),
+) -> Result<(), c_int> {
+    check_name(name.to_bytes())?;
+    let jar = match crate::util::io::read(jar_path, FILE_MAX) {
+        Ok(jar) => jar,
+        Err(err) => {
+            error(&[b"read ", jar_path.to_bytes(), b": ", strerr(-err)].concat());
+            return Err(err);
+        }
+    };
+    check_agent_jar(jar_path, &jar)?;
+    finalize_java(out, name, 0, Section(SECTION_JAR, &jar), keys)
+}
+
+/// Signs the Java directive that unloads upatch `name`, whose payload has
+/// digest `payload`, at `out`.
+pub(super) fn java_unload(
+    name: &CStr,
+    payload: &[u8; 32],
+    out: &CStr,
+    keys: (&CStr, &CStr),
+) -> Result<(), c_int> {
+    check_name(name.to_bytes())?;
+    finalize_java(
+        out,
+        name,
+        DIRECTIVE_UNLOAD,
+        Section(SECTION_UNLOAD, payload),
+        keys,
+    )
+}
+
 /// The policy labels a package signs: their header and the entries,
 /// with the maps that hold the policy found in the object.
 fn policy_labels(obj: &Object, policies: &[u8], nr: u32) -> Result<Vec<u8>, c_int> {
@@ -872,6 +1040,11 @@ pub(super) fn unload_directive(
     out: &CStr,
     pkey: &CStr,
     cert: &CStr,
+    java: bool,
 ) -> Result<(), c_int> {
-    unload(name, payload, out, (pkey, cert))
+    if java {
+        java_unload(name, payload, out, (pkey, cert))
+    } else {
+        unload(name, payload, out, (pkey, cert))
+    }
 }
