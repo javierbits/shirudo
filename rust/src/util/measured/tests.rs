@@ -39,6 +39,7 @@ fn member_type_is_bpf_or_java() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "hashes through OpenSSL")]
 fn init_event_tells_java_from_bpf() {
     let p = PAYLOAD.to_bytes();
     let (cert, root) = ([0u8; 32], [0u8; 32]);
