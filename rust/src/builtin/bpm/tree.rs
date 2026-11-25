@@ -36,7 +36,7 @@ use crate::util::hex::sha256_digest_encode;
 use crate::util::json::JsonEmit;
 use crate::util::keys::{TrustedSet, load_image_root};
 use crate::util::seal::{self, Output};
-use crate::util::{image_config, image_keys, initrd, upatch, upatch_pins};
+use crate::util::{image_config, image_keys, initrd, java_agent, upatch, upatch_pins};
 
 /// The lowercase hex of `bytes` into `out`, NUL-terminated.
 fn hex_into(bytes: &[u8; 32], out: &mut [u8; 65]) {
@@ -294,7 +294,9 @@ fn recover_pending(
     {
         outcome_unmatched(passed, &previous, history_root)?;
     }
-    let absent = cstr(&op.op) == b"add" && !upatch_pins::loaded_pins(cstr(&op.id));
+    let absent = cstr(&op.op) == b"add"
+        && !upatch_pins::loaded_pins(cstr(&op.id))
+        && !java_agent::loaded(cstr(&op.id));
     let outcome = if absent {
         OUTCOME_MODULE_ABSENT
     } else {

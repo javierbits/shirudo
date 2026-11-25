@@ -40,7 +40,7 @@ use crate::util::hex::{self, sha256_digest_encode};
 use crate::util::json::{JsonEmit, JsonField, parse_schema};
 use crate::util::options::{EXIT_USAGE, OPT_ARG, OPT_DONE, OPT_END, OptName, OptParser, OptSpec};
 use crate::util::paths::{key_file, keys_dir};
-use crate::util::upatch::{self, Specs, Upatch, specs_xdp_classes};
+use crate::util::upatch::{self, Specs, TYPE_BPF, Upatch, specs_xdp_classes};
 
 const TREE_MEDIA: &CStr = c"application/vnd.shirudo.upatch.tree.v1+json";
 const TREE_SIG_MEDIA: &CStr = c"application/vnd.shirudo.upatch.tree.signature.v1";
@@ -186,9 +186,13 @@ impl Later {
     }
 }
 
-/// The classes of a load upatch, none for one without an XDP program.
+/// The classes of a load upatch, none for one without an XDP program or
+/// one that is not BPF.
 fn upatch_xdp_classes(body: &[u8]) -> Result<u32, c_int> {
     let u = Upatch::from_bytes(body)?;
+    if u.signed_type() != TYPE_BPF {
+        return Ok(0);
+    }
     let attach = u.signed_attach().unwrap_or_default();
     let specs = Specs::parse(attach, u.hdr.nr_maps, u.hdr.nr_progs)?;
     Ok(specs_xdp_classes(specs.as_slice()))
