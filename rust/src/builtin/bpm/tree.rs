@@ -244,6 +244,11 @@ fn recover_pending(
         Err(err) if err == -ENOENT => return Ok(()),
         pending => pending?,
     };
+    // The segment containing the pending operation may already be gone.
+    if pending.seq <= state.last_seq {
+        remove(TREE_PENDING_PATH);
+        return Ok(());
+    }
     let ops = &p.operations;
     let Some(op) = ops.iter().find(|op| {
         op.seq == pending.seq
@@ -252,10 +257,6 @@ fn recover_pending(
     }) else {
         return Err(-ERANGE);
     };
-    if pending.seq <= state.last_seq {
-        remove(TREE_PENDING_PATH);
-        return Ok(());
-    }
     let (Some(digest), Some(previous)) = (
         digest_bytes(&pending.operation_digest),
         hex32(&state.projection_root),
