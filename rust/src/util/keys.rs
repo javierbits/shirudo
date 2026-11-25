@@ -370,9 +370,7 @@ impl TrustedSet {
 
     /// Whether the set holds the certificate of `fingerprint`.
     fn holds(&self, fingerprint: &[u8; 32]) -> bool {
-        self.certs
-            .iter()
-            .any(|c| c.digests.fingerprint == *fingerprint)
+        member(self, fingerprint).is_some()
     }
 
     /// A certificate added, its bytes kept when given; a voucher makes it
@@ -412,6 +410,13 @@ impl TrustedSet {
 /// The members of a set.
 pub(crate) fn members(set: &TrustedSet) -> &[TrustedCert] {
     &set.certs
+}
+
+/// The member of `set` whose public-key fingerprint is `fingerprint`.
+pub(crate) fn member<'a>(set: &'a TrustedSet, fingerprint: &[u8; 32]) -> Option<&'a TrustedCert> {
+    set.certs
+        .iter()
+        .find(|c| c.digests.fingerprint == *fingerprint)
 }
 
 /// The path a member was read from.

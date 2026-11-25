@@ -293,30 +293,16 @@ impl MeasuredSet {
 }
 
 impl MeasuredSet {
-    /// The members whose pin directory is gone, each handed to `cb` until it
-    /// returns nonzero: how many, that return, or -errno. A load the records
-    /// hold keeps its pin directory until its unload.
-    pub(crate) fn unpinned(&self, mut cb: impl FnMut(&[u8]) -> c_int) -> c_int {
-        use std::os::unix::ffi::OsStrExt;
-
-        let mut n = 0;
+    /// Call `cb` for each member with its payload digest in hex, in the set's
+    /// order. A non-zero return ends the walk with that value.
+    pub(crate) fn each(&self, mut cb: impl FnMut(&[u8], &[u8]) -> c_int) -> c_int {
         for e in &self.entries {
-            let name = &e.name[..];
-            let Ok(dir) = crate::util::upatch_resolve::pin_path(name, &[]) else {
-                return -ENAMETOOLONG;
-            };
-            match std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(dir.as_bytes())) {
-                Ok(_) => continue,
-                Err(e) if e.raw_os_error() == Some(ENOENT) => {}
-                Err(e) => return -e.raw_os_error().unwrap_or(EINVAL),
-            }
-            n += 1;
-            let ret = cb(name);
+            let ret = cb(&e.name, &e.payload_hex);
             if ret != 0 {
                 return ret;
             }
         }
-        n
+        0
     }
 }
 

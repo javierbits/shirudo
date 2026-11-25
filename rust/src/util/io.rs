@@ -13,9 +13,10 @@ use crate::heap::xmalloc;
 use crate::sys::libc::Zeroed;
 use crate::sys::libc::{
     AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, Dir, File, LOCK_EX, O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW,
-    O_PATH, O_RDONLY, PATH_MAX, S_IFDIR, S_IFMT, S_IFREG, S_ISVTX, STATX_ATTR_MOUNT_ROOT,
-    STATX_BASIC_STATS, Statfs, Statx, close, closedir, errno, fdopendir, flock, fstatfs, fsync,
-    ftruncate, geteuid, getline, open, openat, pread, readdir, set_errno, statx, syscall, write,
+    O_NONBLOCK, O_PATH, O_RDONLY, PATH_MAX, S_IFDIR, S_IFMT, S_IFREG, S_ISVTX,
+    STATX_ATTR_MOUNT_ROOT, STATX_BASIC_STATS, Statfs, Statx, close, closedir, errno, fdopendir,
+    flock, fstatfs, fsync, ftruncate, geteuid, getline, open, openat, pread, readdir, set_errno,
+    statx, syscall, write,
 };
 use crate::util::seal;
 use core::ptr::NonNull;
@@ -399,7 +400,7 @@ pub(crate) fn read(path: &CStr, max: usize) -> Result<Vec<u8>, c_int> {
         seal::open_read(path.to_bytes())?
     } else {
         // SAFETY: a C string and flags.
-        let fd = unsafe { open(path.as_ptr(), O_RDONLY | O_CLOEXEC) };
+        let fd = unsafe { open(path.as_ptr(), O_RDONLY | O_NONBLOCK | O_CLOEXEC) };
 
         if fd < 0 {
             return Err(-errno());

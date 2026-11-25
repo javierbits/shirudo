@@ -98,6 +98,37 @@ fn events_fold_into_the_set() {
     assert!(s.entries.is_empty());
 }
 
+#[test]
+fn each_walks_members_in_set_order_and_stops() {
+    let (p, q) = (PAYLOAD.to_bytes(), &b"ff".repeat(PAYLOAD_HASH_LEN)[..]);
+    let mut s = MeasuredSet::default();
+    let mut seen = Vec::new();
+
+    assert_eq!(s.event(UPATCH_LOAD, b"a", p), 0);
+    assert_eq!(s.event(UPATCH_LOAD, b"b", q), 0);
+    assert_eq!(
+        s.each(|name, payload| {
+            seen.push((name.to_vec(), payload.to_vec()));
+            0
+        }),
+        0
+    );
+    assert_eq!(
+        seen,
+        [(b"a".to_vec(), p.to_vec()), (b"b".to_vec(), q.to_vec())]
+    );
+
+    let mut calls = 0;
+    assert_eq!(
+        s.each(|_, _| {
+            calls += 1;
+            -E2BIG
+        }),
+        -E2BIG
+    );
+    assert_eq!(calls, 1);
+}
+
 /// A full set still takes a load of a name it holds, not a new one.
 #[test]
 #[cfg_attr(miri, ignore = "4096 loads, each a scan of the set, take Miri hours")]

@@ -32,6 +32,7 @@ use crate::util::identity;
 use crate::util::image_runtime;
 use crate::util::initrd;
 use crate::util::io::bpffs_mounted_at;
+use crate::util::java_agent;
 use crate::util::json::JsonEmit;
 use crate::util::keyring;
 use crate::util::keys::{self, TrustedSet};
@@ -497,6 +498,9 @@ fn run(init: &mut Init) -> c_int {
     let ret = init_bpffs();
     if ret != 0 {
         return phase(ret, "private bpffs setup");
+    }
+    if let Err(ret) = java_agent::dir_prepare() {
+        return phase(ret, "Java agent directory setup");
     }
     let ret = init_keyring(init);
     if ret != 0 {

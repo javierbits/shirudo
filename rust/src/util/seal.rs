@@ -23,8 +23,8 @@ use crate::sys::libc::Zeroed;
 use crate::sys::libc::{
     AT_FDCWD, AT_SYMLINK_NOFOLLOW, O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW,
     O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, S_IFMT, S_IFREG, STATX_BASIC_STATS, Statx,
-    close, fgetxattr, fsetxattr, fsync, ftruncate, lgetxattr, lsetxattr, mkdirat, openat, renameat,
-    statx, unlinkat,
+    close, fchmod, fgetxattr, fsetxattr, fsync, ftruncate, lgetxattr, lsetxattr, mkdirat, openat,
+    renameat, statx, unlinkat,
 };
 use crate::util::io::{append_line, lock_exclusive, stat_fd, write_complete};
 
@@ -732,7 +732,7 @@ pub(crate) fn mkdir_p(path: &[u8], mode: u32) -> Result<(), c_int> {
 
 /// `data` written whole to `path` through a labelled temporary file,
 /// synced and renamed into place.
-pub(crate) fn write_file(path: &[u8], data: &[u8], mode: u32) -> Result<(), c_int> {
+fn write_file_inner(path: &[u8], data: &[u8], mode: u32, exact: bool) -> Result<(), c_int> {
     let (dir, name) = open_parent(path)?;
     let tmp = [name, b".tmp"].concat();
     if tmp.len() > NAME_MAX {
@@ -748,6 +748,16 @@ pub(crate) fn write_file(path: &[u8], data: &[u8], mode: u32) -> Result<(), c_in
         mode,
     )?;
     let written = inherit(dir.as_fd(), fd.as_fd())
+        .and_then(|()| {
+            if !exact {
+                return Ok(());
+            }
+            // SAFETY: the open temporary file and its requested mode.
+            if unsafe { fchmod(fd.as_raw_fd(), mode) } != 0 {
+                return Err(-errno());
+            }
+            Ok(())
+        })
         .and_then(|()| write_complete(fd.as_fd(), data))
         .and_then(|()| sync(fd.as_fd()));
     let placed = written
@@ -758,4 +768,17 @@ pub(crate) fn write_file(path: &[u8], data: &[u8], mode: u32) -> Result<(), c_in
         unlink_at(dir.as_fd(), &tmp);
     }
     placed
+}
+
+/// As [`write_file`], forcing the final file to carry exactly `mode`,
+/// even when its temporary file already existed or the process has a
+/// restrictive umask.
+pub(crate) fn write_file_mode(path: &[u8], data: &[u8], mode: u32) -> Result<(), c_int> {
+    write_file_inner(path, data, mode, true)
+}
+
+/// `data` written whole to `path` through a labelled temporary file,
+/// synced and renamed into place.
+pub(crate) fn write_file(path: &[u8], data: &[u8], mode: u32) -> Result<(), c_int> {
+    write_file_inner(path, data, mode, false)
 }

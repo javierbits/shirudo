@@ -26,8 +26,8 @@ use std::os::unix::net::UnixDatagram;
 use super::ops::{fail, remove_pins};
 use super::{log_audit, log_err, log_info, log_warn, strerr};
 use crate::errno::{
-    E2BIG, EACCES, EBUSY, EEXIST, EINVAL, EIO, ENAMETOOLONG, ENODATA, ENOENT, ENOKEY, ENOPKG,
-    ENOTDIR, EOPNOTSUPP, EOVERFLOW, EPERM, ERANGE, ESRCH, ESTALE, EXDEV,
+    E2BIG, EACCES, EBADMSG, EBUSY, EEXIST, EINVAL, EIO, EKEYREJECTED, ENAMETOOLONG, ENODATA,
+    ENOENT, ENOKEY, ENOPKG, ENOTDIR, EOPNOTSUPP, EOVERFLOW, EPERM, ERANGE, ESRCH, ESTALE, EXDEV,
 };
 use crate::sys::libc::{
     O_CLOEXEC, O_NOFOLLOW, O_NONBLOCK, O_RDONLY, close, errno, fcntl, fgetxattr, fsetxattr,
@@ -44,6 +44,7 @@ use crate::util::crypto_openssl::sha256_into;
 use crate::util::elf_target;
 use crate::util::identity;
 use crate::util::io::dir_names_at;
+use crate::util::java_agent;
 use crate::util::kernel_btf;
 use crate::util::keyring;
 use crate::util::lskel::{Ctx, F_SLEEPABLE, MAP_TYPE_ARRAY, PROG_TYPE_SYSCALL, VERIFIER_LOG_MAX};
@@ -58,6 +59,7 @@ use crate::util::upatch::{
 };
 use crate::util::upatch_pins::{LINK_PIN_PREFIX, xdp_prog_pin};
 use crate::util::upatch_resolve::{BPFFS_UPATCHES_DIR, XATTR_PAYLOAD, pin_path, tracing_link_kind};
+use crate::util::upatch_verify;
 use crate::util::xdp::{self, XdpDevice};
 
 /// SIG_KEYRING_BPF: the kind of keyring init froze for signed loads.
@@ -1451,6 +1453,102 @@ pub(crate) fn trust_anchor(rep: Option<&mut OpReport>) -> Result<(i32, i32), ()>
     Ok((keyring::KEY_SPEC_BPF_KEYRING, ring))
 }
 
+fn java_apply(
+    u: &Upatch,
+    label: &CStr,
+    verify_only: bool,
+    rep: Option<&mut OpReport>,
+) -> Result<(), ()> {
+    let mut rep = Rep(rep);
+    if !verify_only && u.is_unload() {
+        log_err(
+            &[
+                &b"upatch load: "[..],
+                label.to_bytes(),
+                b" is an UNLOAD directive; use `shirudo upatch unload`",
+            ]
+            .concat(),
+        );
+        rep.fail(c"parse", c"parser_rejected", 0, b"is an UNLOAD directive");
+        return Err(());
+    }
+    let name = u.name();
+    if !upatch::name_valid(Some(name)) {
+        log_err(
+            &[
+                &b"upatch: "[..],
+                label.to_bytes(),
+                b": refusing unsafe upatch name '",
+                name,
+                b"'",
+            ]
+            .concat(),
+        );
+        rep.fail(c"parse", c"parser_rejected", 0, b"unsafe upatch name");
+        return Err(());
+    }
+    if let Err(err) = upatch_verify::java_verify(u) {
+        let (why, category) = match err {
+            e if e == -EKEYREJECTED => (
+                &b"is not signed by an enrolled key"[..],
+                c"signature_rejected",
+            ),
+            e if e == -EBADMSG => (
+                &b"is malformed or its payload digest differs"[..],
+                c"parser_rejected",
+            ),
+            _ => (&b"cannot be verified"[..], c"unknown"),
+        };
+        log_err(
+            &[
+                &b"upatch: "[..],
+                label.to_bytes(),
+                b": the Java upatch ",
+                why,
+                b" (",
+                strerr(-err),
+                b")",
+            ]
+            .concat(),
+        );
+        rep.fail(
+            c"java_verify",
+            category,
+            -err,
+            b"Java upatch verification failed",
+        );
+        return Err(());
+    }
+    if verify_only {
+        return Ok(());
+    }
+    let jar = u.signed_jar().expect("verified Java load has a jar");
+    if let Err(err) = java_agent::install(name, jar) {
+        log_err(
+            &[
+                &b"upatch load: cannot install the jar of "[..],
+                name,
+                b": ",
+                strerr(-err),
+            ]
+            .concat(),
+        );
+        rep.fail(c"java_install", c"unknown", -err, b"cannot install the jar");
+        return Err(());
+    }
+    log_audit(
+        &[
+            &b"upatch load: "[..],
+            name,
+            b" installed, Java agent ",
+            jar.len().to_string().as_bytes(),
+            b" bytes",
+        ]
+        .concat(),
+    );
+    Ok(())
+}
+
 /// Loads `u`, which the caller read once and closes: the name the
 /// signature covers, the loader the kernel verifies and what the caller
 /// then measures and archives are all those bytes, which `label` names
@@ -1463,6 +1561,9 @@ pub(crate) fn apply(
     verify_only: bool,
     rep: Option<&mut OpReport>,
 ) -> Result<(), ()> {
+    if u.is_java() {
+        return java_apply(u, label, verify_only, rep);
+    }
     let mut rep = Rep(rep);
     if !verify_only && u.is_unload() {
         log_err(

@@ -10,13 +10,14 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 
 use super::{Report, hex, print, strerr, version_id};
-use crate::errno::EBADMSG;
+use crate::errno::{EBADMSG, ENAMETOOLONG};
 use crate::util::bpm_tree::{TreeState, build_limit};
 use crate::util::bpm_tree_state::{
     eventlog_matches, outcomes_read, state_read, tree_pending_exists, tree_status_path,
 };
 use crate::util::chain::{self, MeasuredUpatch};
 use crate::util::conditions::{self, CONDITIONS_MAX, Condition, ConditionsInput};
+use crate::util::java_agent;
 use crate::util::keepalive::{
     self, BOUND_LATE, INTEGRITY_UNAVAILABLE, Input, MASK_B64_MAX, MASK_OPS, REGISTER_REBOUND,
     SnapshotOps, TAMPER_UNAVAILABLE, TREE_LOG_MISMATCH, Tree,
@@ -89,8 +90,8 @@ impl View {
         }
     }
 
-    /// The set digest of an init event over every upatch pinned now, and
-    /// how many of them a tree status file says the tree left not loaded.
+    /// The set digest of an init event over every upatch loaded now, and how
+    /// many of them a tree status file says the tree left not loaded.
     fn loaded_set(&mut self) -> c_int {
         let mut names: Vec<Vec<u8>> = std::fs::read_dir(BPFFS_UPATCHES_DIR)
             .map(|d| {
@@ -115,6 +116,28 @@ impl View {
                 self.not_ok += 1;
             }
             set.push(u);
+        }
+        // The tree operation compared by a collector names each upatch and
+        // payload, not its kind, so these members intentionally keep type 0.
+        let mut add_java = |name: &[u8], payload: &[u8; 32]| {
+            // SAFETY: an all-zero member is an empty one.
+            let mut u: MeasuredUpatch = unsafe { core::mem::zeroed() };
+            if name.len() >= u.name.len() {
+                return -ENAMETOOLONG;
+            }
+            u.name[..name.len()].copy_from_slice(name);
+            let payload_hex = hex(payload);
+            u.payload_hex[..payload_hex.len()].copy_from_slice(&payload_hex);
+            let status = tree_status_path(name);
+            if std::fs::metadata(OsStr::from_bytes(status.to_bytes())).is_ok() {
+                self.not_ok += 1;
+            }
+            set.push(u);
+            0
+        };
+        let ret = java_agent::each_loaded(&mut add_java);
+        if ret != 0 {
+            return ret;
         }
         let none = [0u8; 32];
         let (mut digest, mut event) = ([0u8; 32], [0u8; 32]);

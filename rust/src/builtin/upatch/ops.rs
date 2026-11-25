@@ -39,15 +39,16 @@ use crate::util::eventlog;
 use crate::util::help::{Help, HelpSection};
 use crate::util::hex::hex_decode;
 use crate::util::io::read_file;
+use crate::util::java_agent;
 use crate::util::json::JsonEmit;
 use crate::util::kernel_abi;
 use crate::util::measured::MeasuredSet;
 use crate::util::options::{EXIT_USAGE, OPT_ARG, OPT_DONE, OPT_END, OptParser, OptSpec};
 use crate::util::report::{OpReport, report_emit};
 use crate::util::seal;
-use crate::util::upatch::{Upatch, name_valid, pin_name};
+use crate::util::upatch::{TYPE_BPF, TYPE_JAVA, Upatch, name_valid, pin_name};
 use crate::util::upatch_resolve::XATTR_PAYLOAD;
-use crate::util::upatch_verify::archive_verify;
+use crate::util::upatch_verify::{archive_verify, loaded_payload};
 
 /// LSM_LINK_PIN and XATTR_PAYLOAD of util/paths.h, and the most a
 /// .upatch file holds.
@@ -308,6 +309,23 @@ fn io_err(e: &std::io::Error) -> c_int {
     -e.raw_os_error().unwrap_or(crate::errno::EIO)
 }
 
+// A sync failure leaves jars or options temporarily out of step. It
+// refuses no operation: the next upatch command and init retry it.
+fn java_options_sync(op: &[u8]) {
+    if let Err(err) = java_agent::sync() {
+        log_warn(
+            &[
+                &b"upatch "[..],
+                op,
+                b": cannot update /run/environment.d/shirudo.conf: ",
+                strerr(-err),
+                b"; JVMs started now do not see the change",
+            ]
+            .concat(),
+        );
+    }
+}
+
 /// The pin directory of upatch `name`.
 fn pin_dir(name: &[u8]) -> Vec<u8> {
     [BPFFS_UPATCHES_DIR.as_bytes(), b"/", &pin_name(name)].concat()
@@ -383,10 +401,35 @@ fn pin_payload(name: &[u8]) -> Result<[u8; DIGEST_LEN], c_int> {
     }
 }
 
-/// Takes a load the register did not record back out: pins, then
+fn refuse_loaded(rep: &mut OpReport, name: &[u8], missing: &[u8]) -> c_int {
+    log_err(
+        &[
+            b"upatch load: ",
+            name,
+            b" is already loaded",
+            missing,
+            b"; unload it with its signed directive first",
+        ]
+        .concat(),
+    );
+    fail(
+        rep,
+        c"pin",
+        c"already_loaded",
+        crate::errno::EEXIST,
+        b"upatch already loaded",
+    );
+    1
+}
+
+/// Takes a load the register did not record back out: pins or jar, then
 /// archive.
-fn undo_load(name: &[u8]) -> c_int {
-    let ret = remove_pins(name);
+fn undo_load(name: &[u8], ty: u32) -> c_int {
+    let ret = if ty == TYPE_JAVA {
+        java_agent::retire(name).err().unwrap_or(0)
+    } else {
+        remove_pins(name)
+    };
     if ret != 0 {
         return ret;
     }
@@ -396,8 +439,8 @@ fn undo_load(name: &[u8]) -> c_int {
     }
 }
 
-fn unload_unmeasured(name: &[u8]) {
-    match undo_load(name) {
+fn unload_unmeasured(name: &[u8], ty: u32) {
+    match undo_load(name, ty) {
         0 => log_err(
             &[
                 b"upatch load: ",
@@ -422,7 +465,7 @@ fn unload_unmeasured(name: &[u8]) {
 /// An undo pass callback: the rest are still undone when one fails, and
 /// `failed` keeps the first error.
 fn undo_pin(name: &[u8], failed: &mut c_int) -> c_int {
-    match undo_load(name) {
+    match undo_load(name, TYPE_BPF) {
         0 => log_audit(
             &[
                 b"upatch: ",
@@ -540,6 +583,7 @@ fn undo_unmeasured(rep: &mut OpReport, op: &[u8]) -> Result<(), ()> {
     }
     drop(set);
     if ret >= 0 && failed == 0 {
+        java_options_sync(op);
         return Ok(());
     }
     let ret = if ret < 0 { ret } else { failed };
@@ -742,7 +786,7 @@ fn take_lock(rep: &mut OpReport, op: &[u8], nothing: &[u8]) -> Result<eventlog::
 
 /// The eventlog entry `ty` that mirrors the extend `event`, or -errno.
 fn event_record(
-    ty: &CStr,
+    ty: &[u8],
     name: &[u8],
     payload: &[u8; DIGEST_LEN],
     event: &[u8; DIGEST_LEN],
@@ -750,7 +794,7 @@ fn event_record(
 ) -> Result<Vec<u8>, c_int> {
     let mut buf = vec![0u8; 4096];
     let mut e = JsonEmit::fixed(&mut buf);
-    eventlog::record_open(&mut e, ty.to_bytes(), event);
+    eventlog::record_open(&mut e, ty, event);
     e.obj_open_key(b"upatch");
     e.kv_string(b"name", name);
     e.kv_string(b"payload_sha256", &hex(payload));
@@ -763,7 +807,7 @@ fn event_record(
         log_err(
             &[
                 b"eventlog: ",
-                ty.to_bytes(),
+                ty,
                 b" entry encode failed: ",
                 strerr(-e.err()),
             ]
@@ -783,8 +827,8 @@ fn event_record(
 /// whether the register moved before it, come back.
 #[allow(clippy::too_many_arguments)]
 fn measure(
-    tag: &CStr,
-    ty: &CStr,
+    payload_type: u32,
+    load: bool,
     op: &[u8],
     name: &[u8],
     payload: &[u8; DIGEST_LEN],
@@ -792,6 +836,14 @@ fn measure(
     out_chain: Option<&mut [c_char; 65]>,
 ) -> (c_int, bool) {
     let (mut event, mut chain) = ([0u8; DIGEST_LEN], [0u8; DIGEST_LEN]);
+    let Some(tag) = chain::upatch_tag(payload_type, load) else {
+        log_err(&[b"upatch ", op, b": invalid payload type"].concat());
+        return (-EINVAL, false);
+    };
+    let Some(record) = eventlog::upatch_record(payload_type, load) else {
+        log_err(&[b"upatch ", op, b": invalid event record type"].concat());
+        return (-EINVAL, false);
+    };
     let ret = chain::upatch_event(tag, name, payload, &mut event);
     if ret != 0 {
         log_err(
@@ -815,12 +867,13 @@ fn measure(
         log_err(&[b"upatch ", op, why].concat());
         return (ret, false);
     }
-    let appended = event_record(ty, name, payload, &event, reason).and_then(|line| {
-        match eventlog::append(&line) {
-            0 => Ok(()),
-            err => Err(err),
-        }
-    });
+    let appended =
+        event_record(record, name, payload, &event, reason).and_then(
+            |line| match eventlog::append(&line) {
+                0 => Ok(()),
+                err => Err(err),
+            },
+        );
     if let Err(err) = appended {
         log_err(
             &[b"upatch ", op, b": eventlog append failed after the extend: register and log disagree; the operator must reconcile"]
@@ -927,6 +980,7 @@ fn load_steps(a: &OpArgs, file: &CStr, rep: &mut OpReport, name_out: &mut CStrin
     };
     let name = u.name().to_vec();
     let payload = u.hdr.payload_sha256;
+    let payload_type = u.hdr.ty;
     set_payload_hex(rep, &payload);
     *name_out = CString::new(name.clone()).unwrap_or_default();
     rep.name = Some(name_out.clone());
@@ -958,36 +1012,49 @@ fn load_steps(a: &OpArgs, file: &CStr, rep: &mut OpReport, name_out: &mut CStrin
     // an undo of it would take the live one's pins and archive with it.
     // An install of the very payload loaded is done: bpm retries one that
     // a stop cut off between this load and its own record.
-    if let Ok(live) = pin_payload(&name) {
-        if a.loaded_is_done && live == payload {
-            log_info(
-                &[
-                    b"upatch load: ",
-                    &name[..],
-                    b" is already loaded with this payload",
-                ]
-                .concat(),
-            );
-            rep.ok = true;
-            rep.category = Some(c"already_loaded");
-            return 0;
-        }
-        log_err(
+    let state = loaded_payload(&name);
+    if let Ok(live) = state
+        && a.loaded_is_done
+        && live == payload
+    {
+        log_info(
             &[
                 b"upatch load: ",
                 &name[..],
-                b" is already loaded; unload it with its signed directive first",
+                b" is already loaded with this payload",
             ]
             .concat(),
         );
-        fail(
-            rep,
-            c"pin",
-            c"already_loaded",
-            crate::errno::EEXIST,
-            b"upatch already loaded",
-        );
-        return 1;
+        rep.ok = true;
+        rep.category = Some(c"already_loaded");
+        return 0;
+    }
+    match state {
+        Ok(_) => return refuse_loaded(rep, &name, b""),
+        Err(err) if err == -ESTALE => {
+            return refuse_loaded(rep, &name, b", without the jar it archived");
+        }
+        Err(err) if err != -ENOENT => {
+            log_err(
+                &[
+                    &b"upatch load: cannot tell whether "[..],
+                    &name,
+                    b" is loaded: ",
+                    strerr(-err),
+                    b"; nothing loaded",
+                ]
+                .concat(),
+            );
+            fail(
+                rep,
+                c"pin",
+                c"unknown",
+                -err,
+                b"cannot tell whether the upatch is loaded",
+            );
+            return 1;
+        }
+        Err(_) => {}
     }
     if super::loader::apply(&u, file, false, Some(&mut *rep)).is_err() {
         return 1;
@@ -1011,7 +1078,7 @@ fn load_steps(a: &OpArgs, file: &CStr, rep: &mut OpReport, name_out: &mut CStrin
             ]
             .concat(),
         );
-        unload_unmeasured(&name);
+        unload_unmeasured(&name, payload_type);
         fail(
             rep,
             c"persist",
@@ -1022,8 +1089,8 @@ fn load_steps(a: &OpArgs, file: &CStr, rep: &mut OpReport, name_out: &mut CStrin
         return 1;
     }
     let (err, measured) = measure(
-        c"shirudo-upatch",
-        c"upatch_load",
+        payload_type,
+        true,
         b"load",
         &name,
         &payload,
@@ -1032,7 +1099,7 @@ fn load_steps(a: &OpArgs, file: &CStr, rep: &mut OpReport, name_out: &mut CStrin
     );
     if err != 0 {
         if !measured {
-            unload_unmeasured(&name);
+            unload_unmeasured(&name, payload_type);
         }
         let msg: &[u8] = if measured {
             b"eventlog append failed after the extend"
@@ -1041,6 +1108,9 @@ fn load_steps(a: &OpArgs, file: &CStr, rep: &mut OpReport, name_out: &mut CStrin
         };
         fail(rep, c"tpm_extend", chain_category(err, measured), err, msg);
         return 1;
+    }
+    if payload_type == TYPE_JAVA {
+        java_options_sync(b"load");
     }
     rep.ok = true;
     rep.phase = c"done";
@@ -1106,6 +1176,98 @@ pub(super) fn run_unload(args: &[&CStr]) -> c_int {
 fn bytes_of(a: &[c_char]) -> &[u8] {
     // SAFETY: c_char and u8 have one size and alignment.
     unsafe { core::slice::from_raw_parts(a.as_ptr().cast(), a.len()) }
+}
+
+fn java_unload_mismatch(archived: &CStr, rep: &mut OpReport, err: c_int) -> c_int {
+    log_err(
+        &[
+            b"upatch unload: payload_mismatch, ",
+            archived.to_bytes(),
+            b" is not the Java upatch the directive expects; refused",
+        ]
+        .concat(),
+    );
+    fail(
+        rep,
+        c"pin",
+        c"payload_mismatch",
+        if err == -ESTALE { EPERM } else { -err },
+        b"archived payload does not match directive",
+    );
+    1
+}
+
+fn java_unload_locked(
+    name: &[u8],
+    payload: &[u8; DIGEST_LEN],
+    archived: &CStr,
+    rep: &mut OpReport,
+) -> c_int {
+    match archive_verify(name, payload) {
+        Ok(u) if u.hdr.ty == TYPE_JAVA => {}
+        Err(err) if err == -ESTALE && fs::metadata(os(archived.to_bytes())).is_err() => {
+            log_info(&[b"upatch unload: ", name, b" already unloaded (no archive)"].concat());
+            java_options_sync(b"unload");
+            rep.ok = true;
+            rep.category = Some(c"already_unloaded");
+            fail_message(rep, b"already unloaded");
+            return 0;
+        }
+        Ok(_) => return java_unload_mismatch(archived, rep, -ESTALE),
+        Err(err) => return java_unload_mismatch(archived, rep, err),
+    }
+    let (err, _) = measure(
+        TYPE_JAVA,
+        false,
+        b"unload",
+        name,
+        payload,
+        None,
+        Some(&mut rep.chain_after),
+    );
+    if err != 0 {
+        fail(
+            rep,
+            c"tpm_extend",
+            chain_category(err, false),
+            err,
+            b"chain extend failed; nothing removed",
+        );
+        return 1;
+    }
+    let mut err = java_agent::retire(name).err().unwrap_or(0);
+    if err == 0
+        && let Err(e) = fs::remove_file(os(archived.to_bytes()))
+        && e.raw_os_error() != Some(ENOENT)
+    {
+        err = io_err(&e);
+    }
+    if err != 0 {
+        log_err(
+            &[
+                b"upatch unload: measured, but failed to remove ",
+                name,
+                b": ",
+                strerr(-err),
+                b"; repeat the unload",
+            ]
+            .concat(),
+        );
+        fail(
+            rep,
+            c"pin",
+            c"detach_failed",
+            err,
+            b"removal failed after the event was measured",
+        );
+        return 1;
+    }
+    java_options_sync(b"unload");
+    log_info(&[b"upatch unload: ", name, b" removed"].concat());
+    rep.ok = true;
+    rep.phase = c"done";
+    rep.tpm_present = rep.chain_after[0] != 0;
+    0
 }
 
 fn unload_steps(a: &OpArgs, file: &CStr, rep: &mut OpReport, name_out: &mut CString) -> c_int {
@@ -1185,6 +1347,9 @@ fn unload_steps(a: &OpArgs, file: &CStr, rep: &mut OpReport, name_out: &mut CStr
     if super::loader::apply(&u, file, true, Some(&mut *rep)).is_err() {
         log_err(b"upatch unload: signature verification failed; refusing");
         return 1;
+    }
+    if u.hdr.ty == TYPE_JAVA {
+        return java_unload_locked(&name, &payload, &archived, rep);
     }
 
     // The live value is the xattr bpf2 guards; the expected one is
@@ -1277,8 +1442,26 @@ fn unload_steps(a: &OpArgs, file: &CStr, rep: &mut OpReport, name_out: &mut CStr
         }
     };
     if !pinned {
-        match archive_verify(&name, &payload).map(drop) {
-            Ok(()) => unarchive(),
+        match archive_verify(&name, &payload) {
+            Ok(u) if u.hdr.ty == TYPE_BPF => unarchive(),
+            Ok(_) => {
+                log_err(
+                    &[
+                        b"upatch unload: payload_mismatch, ",
+                        archived.to_bytes(),
+                        b" is not the upatch the directive expects; it stays",
+                    ]
+                    .concat(),
+                );
+                fail(
+                    rep,
+                    c"pin",
+                    c"payload_mismatch",
+                    EPERM,
+                    b"archived payload does not match directive",
+                );
+                return 1;
+            }
             Err(err) if err != -ESTALE || fs::metadata(os(archived.to_bytes())).is_ok() => {
                 log_err(
                     &[
@@ -1314,8 +1497,8 @@ fn unload_steps(a: &OpArgs, file: &CStr, rep: &mut OpReport, name_out: &mut CStr
     // shield the register says is gone, which the next status reports and
     // the operator can repeat.
     let (err, _) = measure(
-        c"shirudo-unload",
-        c"upatch_unload",
+        TYPE_BPF,
+        false,
         b"unload",
         &name,
         &payload,
@@ -1415,6 +1598,17 @@ pub(crate) fn purge(name: &CStr, signer: *const Cert, reason: &CStr) -> c_int {
     purge_locked(name.to_bytes(), signer, reason.to_bytes())
 }
 
+fn purge_is_loaded(name: &[u8], payload_type: u32) -> Result<bool, c_int> {
+    if payload_type != TYPE_JAVA {
+        return pinned(name);
+    }
+    match java_agent::payload(name) {
+        Ok(_) => Ok(true),
+        Err(err) if err == -ESTALE || err == -ENOENT => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 fn purge_locked(name: &[u8], signer: *const Cert, reason: &[u8]) -> c_int {
     let archived = archive_path(name);
     if archived.as_bytes().len() >= 4096 {
@@ -1432,20 +1626,21 @@ fn purge_locked(name: &[u8], signer: *const Cert, reason: &[u8]) -> c_int {
     // SAFETY: the container's signature and the caller's certificate.
     let ret = unsafe { cms_signed_by(sig.as_ptr().cast(), sig.len(), signer) };
     let payload = u.hdr.payload_sha256;
+    let payload_type = u.hdr.ty;
     drop(u);
     if ret != 1 {
         return if ret < 0 { ret } else { -ESTALE };
     }
 
     // As for unload: the event first, then the detach it describes.
-    let loaded = match pinned(name) {
+    let loaded = match purge_is_loaded(name, payload_type) {
         Ok(loaded) => loaded,
         Err(err) => return err,
     };
     if loaded {
         let (ret, _) = measure(
-            c"shirudo-unload",
-            c"upatch_unload",
+            payload_type,
+            false,
             b"purge",
             name,
             &payload,
@@ -1455,7 +1650,11 @@ fn purge_locked(name: &[u8], signer: *const Cert, reason: &[u8]) -> c_int {
         if ret != 0 {
             return ret;
         }
-        let ret = remove_pins(name);
+        let ret = if payload_type == TYPE_JAVA {
+            java_agent::retire(name).err().unwrap_or(0)
+        } else {
+            remove_pins(name)
+        };
         if ret != 0 {
             log_err(
                 &[
@@ -1483,6 +1682,9 @@ fn purge_locked(name: &[u8], signer: *const Cert, reason: &[u8]) -> c_int {
             .concat(),
         );
         return err;
+    }
+    if payload_type == TYPE_JAVA {
+        java_options_sync(b"purge");
     }
     let how: &[u8] = if loaded { b"detached" } else { b"archive_only" };
     log_audit(&[b"upatch purge: name=", name, b" reason=", reason, b" ", how].concat());

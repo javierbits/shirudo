@@ -56,7 +56,6 @@ const UPATCH_RECORDS: [UpatchRecord; 4] = [
     },
 ];
 
-#[cfg(any(test, feature = "test-helpers"))]
 pub(crate) fn upatch_record(ty: u32, load: bool) -> Option<&'static [u8]> {
     UPATCH_RECORDS
         .iter()

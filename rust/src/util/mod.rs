@@ -43,6 +43,7 @@ pub(crate) mod inflate;
 pub(crate) mod initrd;
 pub(crate) mod integrity;
 pub(crate) mod io;
+pub(crate) mod java_agent;
 pub(crate) mod json;
 pub(crate) mod keepalive;
 pub(crate) mod keepalive_quote;

@@ -13,19 +13,23 @@ use std::os::fd::BorrowedFd;
 use std::os::unix::ffi::OsStrExt;
 
 use crate::errno::{
-    E2BIG, EIO, EMFILE, ENAMETOOLONG, ENFILE, ENODEV, ENOENT, ENOMEM, ESTALE, EXDEV,
+    E2BIG, EBADMSG, EIO, EKEYREJECTED, EMFILE, ENAMETOOLONG, ENFILE, ENODEV, ENOENT, ENOMEM,
+    ESTALE, EXDEV,
 };
 use crate::util::chain::{memneq_explicit, sha256_2};
 use crate::util::measured::MeasuredSet;
-use crate::util::upatch::{ATTACH_XDP, ProgSpec, ROLE_ATTACH, Specs, Upatch};
+use crate::util::upatch::{ATTACH_XDP, ProgSpec, ROLE_ATTACH, Specs, TYPE_JAVA, Upatch};
 use crate::util::upatch_pins::{
     PAYLOAD_HASH_LEN, Pins, each_pinned, pin_payload, xdp_prog_open, xdp_prog_pin,
 };
-use crate::util::upatch_resolve::each_link_info;
+use crate::util::upatch_resolve::{each_link_info, pin_path};
 use crate::util::xdp::{self, Reconcile, XdpDevice};
+use crate::util::{java_agent, keyring, keys};
 
 /// The archives of the loaded upatches.
 const UPATCHES_DIR: &[u8] = b"/var/lib/shirudo/upatches";
+const RUNTIME_KEYS_DIR: &CStr = c"/run/shirudo/runtime/keys";
+const REVOKED_KEYS_DIR: &CStr = c"/var/lib/shirudo/keys/revoked";
 const PATH_MAX: usize = 4096;
 /// Where `struct bpf_link_info` keeps its type.
 const LINK_TYPE: usize = 0;
@@ -66,6 +70,57 @@ pub(crate) fn payload_digest(u: &Upatch) -> Result<[u8; PAYLOAD_HASH_LEN], c_int
         )
     };
     if ret != 0 { Err(ret) } else { Ok(out) }
+}
+
+fn java_sections_complete(u: &Upatch) -> bool {
+    if u.hdr.ty != TYPE_JAVA || u.signed_type() != TYPE_JAVA || !u.name_signed() {
+        return false;
+    }
+    if u.is_unload() {
+        u.signed_unload_payload().is_some()
+    } else {
+        u.signed_jar().is_some()
+    }
+}
+
+fn signer_enrolled(set: &keys::TrustedSet, fingerprint: &[u8; 32]) -> Result<(), c_int> {
+    let ring = keyring::bpf_serial();
+    if ring < 0 {
+        return Err(ring);
+    }
+    let member = keys::member(set, fingerprint).ok_or(-EKEYREJECTED)?;
+    let held = keyring::holds_cert(ring, keys::cert_der(member)?);
+    if held < 0 {
+        Err(held)
+    } else if held == 0 {
+        Err(-EKEYREJECTED)
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether a Java upatch is complete, its payload digest is authentic,
+/// and its signer is both trusted by the active target and enrolled in
+/// the kernel's BPF keyring.
+pub(crate) fn java_verify(u: &Upatch) -> Result<(), c_int> {
+    if !java_sections_complete(u) {
+        return Err(-EBADMSG);
+    }
+    let digest = payload_digest(u)?;
+    if memneq_explicit(&digest, &u.hdr.payload_sha256) {
+        return Err(-EBADMSG);
+    }
+    let set = keys::load(RUNTIME_KEYS_DIR, Some(REVOKED_KEYS_DIR), true)?;
+    if set.len() == 0 {
+        return Err(-EKEYREJECTED);
+    }
+    let signer = keys::verify_signature(&set, u.data(), u.signature())?;
+    signer_enrolled(&set, &signer)
+}
+
+/// The payload of a loaded BPF or Java upatch.
+pub(crate) fn loaded_payload(name: &[u8]) -> Result<[u8; PAYLOAD_HASH_LEN], c_int> {
+    pin_payload(name).or_else(|_| java_agent::payload(name))
 }
 
 /// The artifact in `file`, when its bytes are what `payload` names:
@@ -217,6 +272,31 @@ pub(crate) fn xdp_each_uncovered(
         }
     }
     0
+}
+
+/// The measured members with neither their pin directory nor their recorded
+/// Java payload installed. Each is handed to `cb` until it returns nonzero.
+pub(crate) fn unpinned(s: &MeasuredSet, mut cb: impl FnMut(&[u8]) -> c_int) -> c_int {
+    let mut n = 0;
+    let ret = s.each(|name, payload_hex| {
+        let dir = match pin_path(name, &[]) {
+            Ok(dir) => dir,
+            Err(err) => return err,
+        };
+        match std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(dir.as_bytes())) {
+            Ok(_) => return 0,
+            Err(e) if e.raw_os_error() == Some(ENOENT) => {}
+            Err(e) => return -e.raw_os_error().unwrap_or(EIO),
+        }
+        if loaded_payload(name)
+            .is_ok_and(|payload| crate::util::hex::encode(&payload).as_slice() == payload_hex)
+        {
+            return 0;
+        }
+        n += 1;
+        cb(name)
+    });
+    if ret != 0 { ret } else { n }
 }
 
 /// The payload the pin directory of `name` records, when the set holds

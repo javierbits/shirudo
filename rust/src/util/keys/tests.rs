@@ -180,6 +180,11 @@ fn a_set_takes_vouched_members_in_rounds_sorted_by_sha256() {
     assert!(find(a).primary() && find(a).voucher().is_none());
     assert_eq!(find(b).voucher(), Some(&fingerprint(a)));
     assert_eq!(find(c).voucher(), Some(&fingerprint(b)));
+    assert_eq!(
+        member(&set, &fingerprint(c)).map(TrustedCert::fingerprint),
+        Some(&fingerprint(c))
+    );
+    assert!(member(&set, &digest(0xff)).is_none());
     assert_eq!(cert_path(find(a)), dir.cpath("keys/cert.der").as_bytes());
     assert_eq!(
         cert_path(find(c)),

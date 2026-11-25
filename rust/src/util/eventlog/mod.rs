@@ -13,7 +13,6 @@ mod records;
 
 #[cfg(test)]
 pub(crate) use records::UPATCH_LOAD;
-#[cfg(feature = "test-helpers")]
 pub(crate) use records::upatch_record;
 pub(crate) use records::{
     EventlogInit, UPATCH_INIT, UPATCH_UNLOAD, UpatchFn, boot_init, boot_lines, replay,

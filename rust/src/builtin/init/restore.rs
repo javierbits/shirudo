@@ -12,13 +12,14 @@ use std::fs::File;
 
 use super::{Init, cat, error, hex, info, strerr, warn};
 use crate::builtin::upatch::loader;
-use crate::errno::{EACCES, EEXIST, EINVAL, ENAMETOOLONG, ENODEV, ENOENT, ENOSPC, EPERM};
+use crate::errno::{EACCES, EEXIST, EINVAL, ENAMETOOLONG, ENODEV, ENOENT, ENOSPC, EPERM, ESTALE};
 use crate::sys::libc::explicit_bzero;
 use crate::text::{cstr, name_has_suffix};
 use crate::util::bpm_tree_state::state_read;
 use crate::util::chain::{self, ChainInitInfo, MeasuredUpatch};
 use crate::util::config::{self, Config};
 use crate::util::eventlog;
+use crate::util::java_agent;
 use crate::util::json::JsonEmit;
 use crate::util::keys;
 use crate::util::measured::{MeasuredSet, upatch_of};
@@ -65,6 +66,38 @@ fn archived() -> Result<Option<Vec<Vec<u8>>>, c_int> {
     Ok(Some(names))
 }
 
+fn java_restore(name: &[u8], file: &CString, u: &Upatch, recorded: bool) -> Result<(), c_int> {
+    match java_agent::payload(name) {
+        Ok(_) => {
+            info(&cat!("boot-restore: ", name, " already installed"));
+            return Ok(());
+        }
+        Err(err) if err == -ESTALE => {}
+        Err(err) => {
+            error(&cat!(
+                "boot-restore: cannot tell whether ",
+                name,
+                " is installed: ",
+                strerr(-err)
+            ));
+            return Err(err);
+        }
+    }
+    if recorded {
+        error(&cat!(
+            "boot-restore: the jar of ",
+            name,
+            " is missing or another after the register was bound this boot (tampered); unload it or reboot"
+        ));
+        return Err(-EPERM);
+    }
+    if loader::apply(u, file, false, None).is_err() {
+        error(&cat!("boot-restore: failed to install ", name));
+        return Err(-EINVAL);
+    }
+    Ok(())
+}
+
 /// Re-applies one archived upatch: Ok(Some(member)) when it counts,
 /// Ok(None) when it is not shirudo's to restore, or the error.
 fn restore_one(
@@ -103,6 +136,10 @@ fn restore_one(
             " is archived without a record of its load (returned or foreign entry); ignored"
         ));
         return Ok(None);
+    }
+    if e.ty == TYPE_JAVA {
+        java_restore(upatch, &file, &u, recorded)?;
+        return Ok(Some(e));
     }
     // By the pins' names alone: an XDP upatch with no device yet has its
     // program pin and no link.
@@ -224,6 +261,14 @@ pub(super) fn boot_restore(recorded: bool) -> Result<Vec<MeasuredUpatch>, c_int>
         }
     };
     let ret = restore_locked(recorded);
+    if ret.is_ok()
+        && let Err(err) = java_agent::sync()
+    {
+        warn(&cat!(
+            "boot-restore: cannot bring the Java agents and /run/environment.d/shirudo.conf in line: ",
+            strerr(-err)
+        ));
+    }
     drop(lock);
     ret
 }

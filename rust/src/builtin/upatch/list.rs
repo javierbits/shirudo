@@ -13,9 +13,10 @@ use std::os::unix::ffi::OsStrExt;
 
 use super::{JSON_MAX, hex, out, pad, print_json};
 use crate::util::help::{Help, HelpSection};
+use crate::util::java_agent;
 use crate::util::json::JsonEmit;
 use crate::util::options::{EXIT_USAGE, OPT_ARG, OPT_DONE, OPT_END, OptParser, OptSpec};
-use crate::util::upatch::{Upatch, name_from_pin, pin_name};
+use crate::util::upatch::{TYPE_JAVA, Upatch, name_from_pin, pin_name};
 use crate::util::upatch_pins::loaded_pins;
 
 pub(super) const UPATCHES_DIR: &str = "/var/lib/shirudo/upatches";
@@ -70,7 +71,11 @@ fn archived(file: &[u8]) -> Option<Archived> {
         ty: if u.is_unload() { b"unload" } else { b"load" },
         payload_type: u.payload_type(),
         payload: hex(&u.hdr.payload_sha256),
-        loaded: loaded(&name),
+        loaded: if u.hdr.ty == TYPE_JAVA {
+            java_agent::loaded(&name)
+        } else {
+            loaded(&name)
+        },
         name,
     })
 }

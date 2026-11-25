@@ -14,6 +14,7 @@ use core::{mem, ptr};
 use std::ffi::{CString, OsStr};
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 
 use crate::errno::{EINPROGRESS, ENAMETOOLONG, ENODEV, ENOENT, ENOKEY};
 use crate::ffi;
@@ -40,6 +41,7 @@ use crate::util::image_runtime;
 use crate::util::initrd;
 use crate::util::integrity::{self, IntegrityCounts};
 use crate::util::io::{self, bpffs_mounted_at};
+use crate::util::java_agent;
 use crate::util::json::{JsonEmit, JsonField, MAX_BYTES, parse_schema};
 use crate::util::kernel_btf;
 use crate::util::keyring;
@@ -54,7 +56,7 @@ use crate::util::tpm;
 use crate::util::upatch::name_from_pin;
 use crate::util::upatch_resolve;
 use crate::util::upatch_table::{self, UpatchTableRow};
-use crate::util::upatch_verify::{Checks, checks_run};
+use crate::util::upatch_verify::{Checks, checks_run, unpinned};
 
 const VAR_LIB: &[u8] = b"/var/lib/shirudo";
 const KEYS_DIR: &CStr = c"/var/lib/shirudo/keys";
@@ -447,25 +449,79 @@ static HELP: Help = Help::new(
     None,
 );
 
-/// A loaded upatch's row: its location, when it loaded, its payload and
-/// its maps.
-fn upatch_rows(pins: &[Vec<u8>]) -> Vec<UpatchTableRow> {
-    if pins.is_empty() {
-        return Vec::new();
+fn row_field(dst: &mut [c_char], src: &[u8]) {
+    let n = src.len().min(dst.len().saturating_sub(1));
+
+    for (d, &s) in dst.iter_mut().zip(&src[..n]) {
+        *d = s as c_char;
     }
-    // vmlinux BTF loaded once; every shirudo upatch attaches to vmlinux.
-    let vbtf = kernel_btf::vmlinux();
-    pins.iter()
-        .map(|pin| {
+    if let Some(end) = dst.get_mut(n) {
+        *end = 0;
+    }
+}
+
+/// A Java agent has no pin: its jar's change time is when it was loaded.
+struct JavaAgent {
+    name: Vec<u8>,
+    payload: [u8; 32],
+    loaded_at: Option<i64>,
+}
+
+impl JavaAgent {
+    fn row(&self) -> UpatchTableRow {
+        // SAFETY: an all-zero row is an empty one.
+        let mut r: UpatchTableRow = unsafe { mem::zeroed() };
+
+        row_field(&mut r.name, &self.name);
+        row_field(&mut r.location, b"java");
+        row_field(&mut r.payload_sha256, &hex(&self.payload));
+        if let Some(t) = self.loaded_at {
+            let mut stamp = [0u8; 32];
+
+            if crate::util::timefmt::iso8601(t, &mut stamp) == 0 {
+                row_field(&mut r.loaded_at, cstr(&stamp));
+            }
+        }
+        // SAFETY: the row's fixed array ends in NUL.
+        r.age_sec = unsafe { upatch_table::age_sec(r.loaded_at.as_ptr()) };
+        r
+    }
+}
+
+fn java_agents() -> Vec<JavaAgent> {
+    let mut agents = Vec::new();
+    let mut add = |name: &[u8], payload: &[u8; 32]| {
+        let loaded_at = java_agent::agent_path(name)
+            .ok()
+            .and_then(|path| std::fs::metadata(OsStr::from_bytes(path.to_bytes())).ok())
+            .map(|st| st.ctime());
+
+        agents.push(JavaAgent {
+            name: name.to_vec(),
+            payload: *payload,
+            loaded_at,
+        });
+        0
+    };
+    if java_agent::each_loaded(&mut add) != 0 {
+        crate::log::warn(b"status: the Java agents could not all be read");
+    }
+    agents
+}
+
+/// The rows of the pinned upatches, then those of the Java agents.
+fn upatch_rows(pins: &[Vec<u8>], java: &[JavaAgent]) -> Vec<UpatchTableRow> {
+    let mut rows = Vec::with_capacity(pins.len() + java.len());
+
+    if !pins.is_empty() {
+        // vmlinux BTF loaded once; every BPF upatch attaches to vmlinux.
+        let vbtf = kernel_btf::vmlinux();
+        rows.extend(pins.iter().map(|pin| {
             // SAFETY: an all-zero row is an empty one.
             let mut r: UpatchTableRow = unsafe { mem::zeroed() };
             let name = message(&[&name_from_pin(pin).unwrap_or_else(|| pin.clone())]);
 
-            let bytes = name.as_bytes_with_nul();
-            let n_name = bytes.len().min(r.name.len());
-            for (d, &s) in r.name.iter_mut().zip(&bytes[..n_name]) {
-                *d = s as c_char;
-            }
+            row_field(&mut r.name, name.to_bytes());
             // SAFETY: each field's room.
             unsafe {
                 let upatch = name.to_bytes();
@@ -487,8 +543,10 @@ fn upatch_rows(pins: &[Vec<u8>]) -> Vec<UpatchTableRow> {
             r.n_maps =
                 u32::try_from(map_read::list(Some(name.to_bytes())).len()).unwrap_or(u32::MAX);
             r
-        })
-        .collect()
+        }));
+    }
+    rows.extend(java.iter().map(JavaAgent::row));
+    rows
 }
 
 /// A link of a keyring: what it is and whether init froze it.
@@ -974,6 +1032,14 @@ fn check_pins() -> Checked {
                 c.unmeasured + archived
             };
         }
+        if c.unmeasured >= 0 {
+            let mut on_unbacked = |name: &[u8]| {
+                note(&mut c.unmeasured_names, name);
+                0
+            };
+            let jars = java_agent::unbacked(Some(&mut on_unbacked));
+            c.unmeasured = if jars < 0 { jars } else { c.unmeasured + jars };
+        }
         let (tampered, lost, uncovered) = (
             &mut c.xdp_tampered_names,
             &mut c.links_lost_names,
@@ -1009,7 +1075,7 @@ fn check_pins() -> Checked {
         let (nr_changed, nr_lost, nr_uncovered) =
             (checks.nr_changed, checks.nr_lost, checks.nr_uncovered);
         let (check_err, coverage_err) = (checks.check_err, checks.coverage_err);
-        let unpinned = set.unpinned(|name| {
+        let unpinned = unpinned(set, |name| {
             note(&mut c.links_lost_names, name);
             0
         });
@@ -1130,6 +1196,7 @@ struct Report {
     cert_present: bool,
     is_target: bool,
     pins: Vec<Vec<u8>>,
+    java: Vec<JavaAgent>,
     checked: Box<Checked>,
     assets: Assets,
     tamper: Result<TamperCounts, c_int>,
@@ -1198,6 +1265,7 @@ impl Report {
         let lsm_attached = fd >= 0;
 
         let pins = list_dir(BPFFS_UPATCHES_DIR).unwrap_or_default();
+        let java = java_agents();
         let checked = Box::new(check_pins());
         let assets = Assets::gather();
         let tamper = tamper::read();
@@ -1244,6 +1312,7 @@ impl Report {
             cert_present,
             is_target: cert_present || lsm_attached || serial >= 0,
             pins,
+            java,
             checked,
             assets,
             tamper,
@@ -1334,7 +1403,8 @@ impl Report {
             + self.bpf.links().len()
             + self.dmv.certs.len()
             + self.dmv.links().len();
-        let mut cap = 16384 + self.pins.len() * (6 * size_of::<UpatchTableRow>() + 256);
+        let mut cap =
+            16384 + (self.pins.len() + self.java.len()) * (6 * size_of::<UpatchTableRow>() + 256);
 
         cap += entries * (6 * (keyring::DESC_MAX + SUBJECT_MAX) + 512);
         if let (true, Some((_, bytes))) = (include_eventlog, self.eventlog) {
@@ -1428,7 +1498,7 @@ impl Report {
         self.bpf.emit_json(e, b"bpf_keyring", b"primary");
         self.dmv.emit_json(e, b"dm_verity_keyring", b"config");
         e.kv_bool(b"signing_key_present", self.is_operator);
-        upatch_table::emit_json(e, &upatch_rows(&self.pins));
+        upatch_table::emit_json(e, &upatch_rows(&self.pins, &self.java));
         self.emit_assets(e);
         // What the guards counted this boot, every counter by name so a
         // collector's keys stay the same from one record to the next;
@@ -1543,7 +1613,7 @@ impl Report {
         // SAFETY: the input and room for the reason.
         unsafe { conditions::status_reason(cin, &mut reason) };
         let nc = conditions::conditions(cin, &mut conds);
-        let rows = upatch_rows(&self.pins);
+        let rows = upatch_rows(&self.pins, &self.java);
         let mut folded: Vec<&[u8]> = Vec::new();
         // A section a condition vouches for says nothing the condition
         // did not: it unfolds when that condition is not OK on a target,
