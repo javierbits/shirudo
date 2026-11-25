@@ -1205,7 +1205,7 @@ $(FUZZ_TARGETS): $(FUZZ_HEADERS) $(FUZZ_STAMP) $(RUST_FUZZ_LIB)
 		$(filter-out $(FUZZ_INCLUDED),$(filter %.c %.o,$^)) $(FUZZ_LIBS)
 
 # The Rust targets each call the fuzz.rs entry point of one module.
-FUZZ_NAMES := kernel beefile elf tree-state image prog-metadata upatch \
+FUZZ_NAMES := kernel beefile elf tree-state image prog-metadata upatch upatch-info \
 	     bpm-tar bpm-index bpm-info bpm-package oci-manifest oci-http \
 	     oci-ref registry-auth config tpm-wire json tree cms eventlog otel \
 	     attest config-update decoder kconfig quote-check rodata serializer

@@ -291,3 +291,6 @@ pub(super) fn run(args: &[&CStr]) -> c_int {
         0
     }
 }
+
+#[cfg(shirudo_fuzz)]
+mod fuzz;
