@@ -124,9 +124,13 @@ impl<'a> Easy<'a> {
     /// `callback` takes its last argument for what `data` points at, and
     /// `data` stays valid for as long as the handle lives, touched by
     /// nothing else while a transfer runs.
-    pub(crate) unsafe fn set_write<T>(&mut self, callback: WriteCallback, data: *mut T) {
+    pub(crate) unsafe fn set_write<T>(
+        &mut self,
+        callback: WriteCallback,
+        data: *mut T,
+    ) -> CurlCode {
         // SAFETY: the caller's callback and data, for a write callback.
-        unsafe { self.set_callback(CURLOPT_WRITEFUNCTION, callback, CURLOPT_WRITEDATA, data) };
+        unsafe { self.set_callback(CURLOPT_WRITEFUNCTION, callback, CURLOPT_WRITEDATA, data) }
     }
 
     /// The response's header lines, handed to `callback` with `data`.
@@ -134,9 +138,13 @@ impl<'a> Easy<'a> {
     /// # Safety
     ///
     /// As for set_write().
-    pub(crate) unsafe fn set_header<T>(&mut self, callback: WriteCallback, data: *mut T) {
+    pub(crate) unsafe fn set_header<T>(
+        &mut self,
+        callback: WriteCallback,
+        data: *mut T,
+    ) -> CurlCode {
         // SAFETY: the caller's callback and data, for a header callback.
-        unsafe { self.set_callback(CURLOPT_HEADERFUNCTION, callback, CURLOPT_HEADERDATA, data) };
+        unsafe { self.set_callback(CURLOPT_HEADERFUNCTION, callback, CURLOPT_HEADERDATA, data) }
     }
 
     /// What a transfer sends, asked of `callback` with `data`.
@@ -144,9 +152,9 @@ impl<'a> Easy<'a> {
     /// # Safety
     ///
     /// As for set_write().
-    pub(crate) unsafe fn set_read<T>(&mut self, callback: ReadCallback, data: *mut T) {
+    pub(crate) unsafe fn set_read<T>(&mut self, callback: ReadCallback, data: *mut T) -> CurlCode {
         // SAFETY: the caller's callback and data, for a read callback.
-        unsafe { self.set_callback(CURLOPT_READFUNCTION, callback, CURLOPT_READDATA, data) };
+        unsafe { self.set_callback(CURLOPT_READFUNCTION, callback, CURLOPT_READDATA, data) }
     }
 
     /// # Safety
@@ -160,11 +168,14 @@ impl<'a> Easy<'a> {
         callback: WriteCallback,
         data_option: c_int,
         data: *mut T,
-    ) {
+    ) -> CurlCode {
         // SAFETY: the handle, and a callback of the type `function` takes.
-        unsafe { curl_easy_setopt(self.raw(), function, callback) };
+        let code = unsafe { curl_easy_setopt(self.raw(), function, callback) };
+        if code != CURLE_OK {
+            return code;
+        }
         // SAFETY: the handle, and the data the caller keeps valid.
-        unsafe { curl_easy_setopt(self.raw(), data_option, data.cast::<c_void>()) };
+        unsafe { curl_easy_setopt(self.raw(), data_option, data.cast::<c_void>()) }
     }
 
     /// The SSL_CTX callback, called with `data` each time libcurl

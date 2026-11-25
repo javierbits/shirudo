@@ -225,11 +225,17 @@ fn transfer_seconds(room: u64) -> c_long {
 /// every other command waits for, longer than the most a transfer may
 /// carry takes at a floor rate: `room` bytes, in a minute and at 128 KiB
 /// a second.
-fn deadlines(easy: &mut Easy<'_>, room: u64) {
-    easy.set_long(CURLOPT_CONNECTTIMEOUT, 30);
-    easy.set_long(CURLOPT_LOW_SPEED_LIMIT, 1);
-    easy.set_long(CURLOPT_LOW_SPEED_TIME, 60);
-    easy.set_long(CURLOPT_TIMEOUT, transfer_seconds(room));
+fn set_transfer_limits(easy: &mut Easy<'_>, room: u64) -> bool {
+    easy.set_long(CURLOPT_NOSIGNAL, 1) == CURLE_OK
+        && easy.set_long(CURLOPT_CONNECTTIMEOUT, 30) == CURLE_OK
+        && easy.set_long(CURLOPT_LOW_SPEED_LIMIT, 1) == CURLE_OK
+        && easy.set_long(CURLOPT_LOW_SPEED_TIME, 60) == CURLE_OK
+        && easy.set_long(CURLOPT_TIMEOUT, transfer_seconds(room)) == CURLE_OK
+}
+
+fn verify_peer(easy: &mut Easy<'_>) -> bool {
+    easy.set_long(CURLOPT_SSL_VERIFYPEER, 1) == CURLE_OK
+        && easy.set_long(CURLOPT_SSL_VERIFYHOST, 2) == CURLE_OK
 }
 
 /// A `Name: value` header appended to `list` through a buffer of `CAP`
@@ -295,25 +301,13 @@ fn curl_once(
     // cap otherwise, and the request body for an upload.
     let room = file.as_ref().map_or(MAX_HTTP_BODY as u64, |f| f.room)
         + req.body.map_or(0, |b| b.len() as u64);
-    let r_ptr = ptr::from_mut(r);
 
-    easy.set_str(CURLOPT_URL, req.url);
-    easy.set_str(CURLOPT_CUSTOMREQUEST, req.method);
-    if req.method.to_bytes().eq_ignore_ascii_case(b"HEAD") {
-        easy.set_long(CURLOPT_NOBODY, 1);
+    if easy.set_headers(&headers) != CURLE_OK
+        || easy.set_error_buffer(&mut errbuf) != CURLE_OK
+        || !configure_request(&mut easy, req, room, follow, &c.base_url)
+    {
+        return setup_failed(req.url);
     }
-    easy.set_headers(&headers);
-    easy.set_error_buffer(&mut errbuf);
-    easy.set_long(CURLOPT_NOSIGNAL, 1);
-    deadlines(&mut easy, room);
-    // OCI registries commonly redirect blob GETs to a signed CDN URL.
-    // Follow only for blobs, never for manifest or upload calls.
-    easy.set_long(CURLOPT_FOLLOWLOCATION, c_long::from(follow));
-    if follow {
-        follow_redirects(&mut easy, &c.base_url);
-    }
-    easy.set_long(CURLOPT_SSL_VERIFYPEER, 1);
-    easy.set_long(CURLOPT_SSL_VERIFYHOST, 2);
     if tls_curl_policy(&mut easy, Some(as_cstr(&c.ca_file))).is_err() {
         crate::log::err(
             &[
@@ -325,24 +319,13 @@ fn curl_once(
         );
         return -EHOSTUNREACH;
     }
-    if let Some(body) = req.body {
-        easy.set_post_fields(body);
+    if req
+        .body
+        .is_some_and(|body| easy.set_post_fields(body) != CURLE_OK)
+        || !configure_response(&mut easy, r, file.as_deref_mut())
+    {
+        return setup_failed(req.url);
     }
-    match file.as_deref_mut() {
-        Some(f) => {
-            easy.set_off(CURLOPT_MAXFILESIZE_LARGE, f.room as CurlOff);
-            // SAFETY: write_file() takes its data for the sink, which
-            // outlives the handle and which nothing else touches while
-            // the transfer runs.
-            unsafe { easy.set_write(write_file, ptr::from_mut(f)) };
-        }
-        // SAFETY: write_memory() takes its data for the response, which
-        // outlives the handle and which only the callbacks touch while
-        // the transfer runs.
-        None => unsafe { easy.set_write(write_memory, r_ptr) },
-    }
-    // SAFETY: header() takes its data for the response, as above.
-    unsafe { easy.set_header(header, r_ptr) };
     let cc = easy.perform();
     let mut status = easy.response_code().unwrap_or(0);
     drop(easy);
@@ -359,19 +342,77 @@ fn curl_once(
     if status < 0 { -EHOSTUNREACH } else { 0 }
 }
 
-/// Up to five redirects, over no weaker a transport than the registry's
-/// own, and the Authorization kept to the registry's host.
-fn follow_redirects(easy: &mut Easy<'_>, base_url: &[u8]) {
-    let protocols: &CStr = if base_url.starts_with(b"https://") {
+fn configure_request(
+    easy: &mut Easy<'_>,
+    req: &Request,
+    room: u64,
+    follow: bool,
+    base_url: &[u8],
+) -> bool {
+    let head = req.method.to_bytes().eq_ignore_ascii_case(b"HEAD");
+
+    easy.set_str(CURLOPT_URL, req.url) == CURLE_OK
+        && easy.set_str(CURLOPT_CUSTOMREQUEST, req.method) == CURLE_OK
+        && (!head || easy.set_long(CURLOPT_NOBODY, 1) == CURLE_OK)
+        && set_transfer_limits(easy, room)
+        && easy.set_long(CURLOPT_FOLLOWLOCATION, c_long::from(follow)) == CURLE_OK
+        && (!follow || configure_redirects(easy, base_url))
+        && verify_peer(easy)
+}
+
+fn configure_response(
+    easy: &mut Easy<'_>,
+    r: &mut HttpResponse,
+    file: Option<&mut FileSink>,
+) -> bool {
+    let response = ptr::from_mut(r);
+    let write = match file {
+        Some(file) => {
+            let Ok(room) = CurlOff::try_from(file.room) else {
+                return false;
+            };
+            if easy.set_off(CURLOPT_MAXFILESIZE_LARGE, room) != CURLE_OK {
+                return false;
+            }
+            // SAFETY: the caller holds the sink through the transfer and
+            // only write_file() touches it while the transfer runs.
+            unsafe { easy.set_write(write_file, ptr::from_mut(file)) }
+        }
+        // SAFETY: the caller holds the response through the transfer and
+        // only the callbacks touch it while the transfer runs.
+        None => unsafe { easy.set_write(write_memory, response) },
+    };
+    write == CURLE_OK
+        // SAFETY: header() borrows the response as write_memory() does.
+        && unsafe { easy.set_header(header, response) } == CURLE_OK
+}
+
+fn allowed_protocols(base_url: &[u8]) -> &'static CStr {
+    if base_url.starts_with(b"https://") {
         c"https"
     } else {
         c"http,https"
-    };
+    }
+}
 
-    easy.set_long(CURLOPT_MAXREDIRS, 5);
-    easy.set_str(CURLOPT_REDIR_PROTOCOLS_STR, protocols);
-    // Keep Authorization restricted to the original registry host.
-    easy.set_long(CURLOPT_UNRESTRICTED_AUTH, 0);
+/// Up to five redirects, over no weaker a transport than the registry's
+/// own, and the Authorization kept to the registry's host.
+fn configure_redirects(easy: &mut Easy<'_>, base_url: &[u8]) -> bool {
+    easy.set_long(CURLOPT_MAXREDIRS, 5) == CURLE_OK
+        && easy.set_str(CURLOPT_REDIR_PROTOCOLS_STR, allowed_protocols(base_url)) == CURLE_OK
+        && easy.set_long(CURLOPT_UNRESTRICTED_AUTH, 0) == CURLE_OK
+}
+
+fn setup_failed(url: &CStr) -> c_int {
+    crate::log::err(
+        &[
+            &b"bpm OCI request "[..],
+            url.to_bytes(),
+            b": cannot set up the transfer",
+        ]
+        .concat(),
+    );
+    -EINVAL
 }
 
 /// Why the request to `url` failed: the message libcurl left in
@@ -446,24 +487,17 @@ fn token_exchange(
     let url = token_url(&easy, challenge)?;
     // The realm is the registry's to name and the credentials go there:
     // over no weaker a transport than the registry's own.
-    let protocols: &CStr = if c.base_url.starts_with(b"https://") {
-        c"https"
-    } else {
-        c"http,https"
-    };
-    easy.set_str(CURLOPT_URL, &url);
-    easy.set_str(CURLOPT_PROTOCOLS_STR, protocols);
-    easy.set_long(CURLOPT_HTTPGET, 1);
-    easy.set_headers(&headers);
-    easy.set_long(CURLOPT_NOSIGNAL, 1);
-    deadlines(&mut easy, MAX_HTTP_BODY as u64);
-    // SAFETY: write_memory() takes its data for the response, which
-    // outlives the handle and which only the callback touches while the
-    // transfer runs.
-    unsafe { easy.set_write(write_memory, ptr::from_mut(r)) };
-    easy.set_long(CURLOPT_SSL_VERIFYPEER, 1);
-    easy.set_long(CURLOPT_SSL_VERIFYHOST, 2);
-    if tls_curl_policy(&mut easy, Some(as_cstr(&c.ca_file))).is_err() {
+    if easy.set_str(CURLOPT_URL, &url) != CURLE_OK
+        || easy.set_str(CURLOPT_PROTOCOLS_STR, allowed_protocols(&c.base_url)) != CURLE_OK
+        || easy.set_long(CURLOPT_HTTPGET, 1) != CURLE_OK
+        || easy.set_headers(&headers) != CURLE_OK
+        || !set_transfer_limits(&mut easy, MAX_HTTP_BODY as u64)
+        // SAFETY: the caller holds the response through the transfer
+        // and only write_memory() touches it while the transfer runs.
+        || unsafe { easy.set_write(write_memory, ptr::from_mut(r)) } != CURLE_OK
+        || !verify_peer(&mut easy)
+        || tls_curl_policy(&mut easy, Some(as_cstr(&c.ca_file))).is_err()
+    {
         return Err(-EINVAL);
     }
     let cc = easy.perform();
