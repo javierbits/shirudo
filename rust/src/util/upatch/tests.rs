@@ -210,13 +210,9 @@ fn policy_path_pattern_is_the_last_component_with_a_wildcard() {
     assert_eq!(policy_path_pattern(root), Some(&b"v?"[..]));
 }
 
-/// A container named `name` of an 8-byte loader and signature, whose
-/// data is the signed `sections`, each a tag and its bytes, then their
-/// directory and its trailer.
-fn container(name: &[u8], sections: &[(u32, &[u8])]) -> Vec<u8> {
+fn signed_data(sections: &[(u32, &[u8])]) -> Vec<u8> {
     let words = |w: &[u32]| w.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
     let (mut data, mut dir) = (Vec::new(), Vec::new());
-
     for &(tag, bytes) in sections {
         dir.extend(words(&[tag, 0, data.len() as u32, bytes.len() as u32]));
         data.extend_from_slice(bytes);
@@ -229,6 +225,14 @@ fn container(name: &[u8], sections: &[(u32, &[u8])]) -> Vec<u8> {
         dir_off,
         sections.len() as u32,
     ]));
+    data
+}
+
+/// A BPF container named `name` of an 8-byte loader and signature,
+/// whose data holds the signed sections.
+fn container(name: &[u8], sections: &[(u32, &[u8])]) -> Vec<u8> {
+    let words = |w: &[u32]| w.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+    let data = signed_data(sections);
     let at = HEADER_SIZE as u32;
     let mut c = [&MAGIC.to_le_bytes()[..], &words(&[VERSION, 0]), name].concat();
     c.resize(304, 0);
@@ -251,6 +255,54 @@ fn container(name: &[u8], sections: &[(u32, &[u8])]) -> Vec<u8> {
     c.resize(HEADER_SIZE + 16, 0);
     c.extend(data);
     c
+}
+
+/// A Java LOAD container whose signed type is present with `ty`, or
+/// absent. Its data is NAME, JAR and optionally TYPE.
+fn java_container(ty: Option<u32>) -> Vec<u8> {
+    let words = |w: &[u32]| w.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+    let mut name = [0u8; NAME_MAX];
+    let jar = b"PK\x03\x04jar!";
+    let ty_bytes = ty.unwrap_or_default().to_le_bytes();
+
+    name[..5].copy_from_slice(b"agent");
+    let mut sections: Vec<(u32, &[u8])> = vec![(SECTION_NAME, &name), (SECTION_JAR, jar)];
+    if ty.is_some() {
+        sections.push((SECTION_TYPE, &ty_bytes));
+    }
+    let data = signed_data(&sections);
+    let signature_off = HEADER_SIZE as u32;
+    let data_off = signature_off + 8;
+    let mut c = [
+        &MAGIC.to_le_bytes()[..],
+        &words(&[VERSION, 0]),
+        &b"agent"[..],
+    ]
+    .concat();
+    c.resize(304, 0);
+    c.extend(words(&[
+        0,
+        0,
+        signature_off,
+        8,
+        0,
+        0,
+        data_off,
+        data.len() as u32,
+        0,
+        0,
+        0,
+        0,
+        TYPE_JAVA,
+        0,
+    ]));
+    c.resize(data_off as usize, 0);
+    c.extend(data);
+    c
+}
+
+fn set_header_field(c: &mut [u8], field: usize, value: u32) {
+    c[304 + field * 4..304 + (field + 1) * 4].copy_from_slice(&value.to_le_bytes());
 }
 
 #[test]
@@ -385,6 +437,50 @@ fn a_cut_container_is_refused() {
     for len in [0, 8, HEADER_SIZE, c.len() - 1] {
         assert_eq!(Upatch::from_bytes(&c[..len]).err(), Some(-EINVAL), "{len}");
     }
+}
+
+#[test]
+fn java_load_opens_with_its_jar() {
+    let c = java_container(Some(TYPE_JAVA));
+    let u = Upatch::from_bytes(&c).unwrap();
+
+    assert_eq!(u.payload_type(), b"java");
+    assert_eq!(u.signed_type(), TYPE_JAVA);
+    assert!(u.name_signed());
+    assert_eq!(u.signed_jar(), Some(&b"PK\x03\x04jar!"[..]));
+    assert!(u.loader().is_empty());
+}
+
+#[test]
+fn java_header_needs_the_signed_type() {
+    assert_eq!(
+        Upatch::from_bytes(&java_container(Some(TYPE_BPF))).err(),
+        Some(-EINVAL)
+    );
+    assert_eq!(
+        Upatch::from_bytes(&java_container(None)).err(),
+        Some(-EINVAL)
+    );
+
+    let mut unknown = java_container(Some(TYPE_JAVA));
+    set_header_field(&mut unknown, 12, 3);
+    assert_eq!(Upatch::from_bytes(&unknown).err(), Some(-EINVAL));
+}
+
+#[test]
+fn java_header_carries_no_loader() {
+    let mut loader = java_container(Some(TYPE_JAVA));
+    set_header_field(&mut loader, 0, HEADER_SIZE as u32);
+    set_header_field(&mut loader, 1, 8);
+    assert_eq!(Upatch::from_bytes(&loader).err(), Some(-EINVAL));
+
+    let mut programs = java_container(Some(TYPE_JAVA));
+    set_header_field(&mut programs, 10, 1);
+    assert_eq!(Upatch::from_bytes(&programs).err(), Some(-EINVAL));
+
+    let mut unsigned = java_container(Some(TYPE_JAVA));
+    set_header_field(&mut unsigned, 3, 0);
+    assert_eq!(Upatch::from_bytes(&unsigned).err(), Some(-EINVAL));
 }
 
 #[test]

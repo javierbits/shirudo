@@ -40,7 +40,14 @@ fuzz_target!(shirudo_fuzz_upatch, shirudo_fuzz_upatch_init, |data| {
     if let Some(attach) = u.signed_attach() {
         specs(attach, u.hdr.nr_maps, u.hdr.nr_progs);
     }
-    core::hint::black_box((u.signed_name(), u.is_unload(), u.policy_labels()));
+    core::hint::black_box((
+        u.signed_name(),
+        u.signed_type(),
+        u.signed_jar(),
+        u.is_unload(),
+        u.payload_type(),
+        u.policy_labels(),
+    ));
     for d in u.decoders() {
         core::hint::black_box(d);
     }

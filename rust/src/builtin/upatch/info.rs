@@ -87,6 +87,7 @@ fn json(u: &Upatch, path: &[u8]) -> c_int {
         b"attach_metadata_len",
         json_len(u.signed_attach().map_or(0, <[u8]>::len)),
     );
+    e.kv_int(b"jar_len", json_len(u.signed_jar().map_or(0, <[u8]>::len)));
     match u.signed_unload_payload() {
         Some(p) => e.kv_string(b"unload_payload_sha256", &hex(p)),
         None => e.kv_null(b"unload_payload_sha256"),
@@ -178,6 +179,12 @@ fn text(u: &Upatch, path: &[u8]) {
         None => "(none)".into(),
     };
     t.extend(section("Attach metadata:", attach.as_bytes()));
+    if let Some(jar) = u.signed_jar() {
+        t.extend(section(
+            "Java agent jar:",
+            format!("{} bytes", jar.len()).as_bytes(),
+        ));
+    }
     match u.signed_unload_payload() {
         Some(p) => t.extend(section("Unload payload:", &hex(p))),
         None => t.extend(section("Unload payload:", b"(none)")),

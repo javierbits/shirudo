@@ -32,6 +32,7 @@ pub(crate) const VERSION: u32 = 1;
 pub(crate) const HEADER_SIZE: usize = 360;
 pub(crate) const DIRECTIVE_UNLOAD: u32 = 1;
 pub(crate) const TYPE_BPF: u32 = 1;
+pub(crate) const TYPE_JAVA: u32 = 2;
 
 pub(crate) const SIGNED_TRAILER_MAGIC: u32 = 0x5254_4753;
 pub(crate) const SIGNED_VERSION: u32 = 1;
@@ -41,6 +42,8 @@ pub(crate) const SECTION_ATTACH: u32 = 0x4d47_5055;
 pub(crate) const SECTION_UNLOAD: u32 = 0x444c_4e55;
 pub(crate) const SECTION_DECODERS: u32 = 0x4244_4344;
 pub(crate) const SECTION_POLICY_LABELS: u32 = 0x4c50_4853;
+pub(crate) const SECTION_TYPE: u32 = 0x5059_5450;
+pub(crate) const SECTION_JAR: u32 = 0x4156_414a;
 
 pub(crate) const POLICY_LABELS_MAGIC: u32 = 0x4c50_4853;
 pub(crate) const POLICY_LABELS_VERSION: u32 = 1;
@@ -151,6 +154,8 @@ struct Signed {
     unload_payload: Option<Range<usize>>,
     decoders: Option<DecodersAt>,
     policy_labels: Option<PolicyLabelsAt>,
+    ty: Option<Range<usize>>,
+    jar: Option<Range<usize>>,
 }
 
 /// The signed DECODERS section, and how many decoders it holds.
@@ -355,13 +360,8 @@ fn section_inside(off: u32, len: u32, n: usize) -> bool {
     !(len != 0 && (off as usize) < HEADER_SIZE)
 }
 
-/// Whether the header `h` places every section within the `n` bytes of
-/// its container, the loader's and the signature's not empty: -EINVAL
-/// when not.
-fn validate_bounds(h: &UpatchHostHeader, n: usize) -> Result<(), c_int> {
-    if h.ty != TYPE_BPF {
-        return Err(-EINVAL);
-    }
+/// Whether a BPF header's loader-specific fields are valid.
+fn validate_bpf_bounds(h: &UpatchHostHeader, n: usize) -> Result<(), c_int> {
     if (h.loader_insns_off as usize) < HEADER_SIZE
         || !h.loader_insns_off.is_multiple_of(8)
         || !h.loader_insns_len.is_multiple_of(8)
@@ -369,19 +369,44 @@ fn validate_bounds(h: &UpatchHostHeader, n: usize) -> Result<(), c_int> {
     {
         return Err(-EINVAL);
     }
-    if !section_inside(h.signature_off, h.signature_len, n)
-        || !section_inside(h.metadata_off, h.metadata_len, n)
-        || !section_inside(h.data_off, h.data_len, n)
-    {
-        return Err(-EINVAL);
-    }
-    if h.rodata_data_off > h.data_len {
-        return Err(-EINVAL);
-    }
-    if h.loader_insns_len == 0 || h.signature_len == 0 {
+    if h.rodata_data_off > h.data_len || h.loader_insns_len == 0 {
         return Err(-EINVAL);
     }
     Ok(())
+}
+
+/// A Java payload is all signed data: none of the BPF loader fields
+/// apply.
+fn validate_java_bounds(h: &UpatchHostHeader) -> Result<(), c_int> {
+    if h.loader_insns_off != 0
+        || h.loader_insns_len != 0
+        || h.metadata_len != 0
+        || h.log_buf_sz != 0
+        || h.nr_maps != 0
+        || h.nr_progs != 0
+        || h.rodata_data_off != 0
+        || h.data_len == 0
+    {
+        return Err(-EINVAL);
+    }
+    Ok(())
+}
+
+/// Whether the header `h` places every section within the `n` bytes of
+/// its container and describes one supported payload type.
+fn validate_bounds(h: &UpatchHostHeader, n: usize) -> Result<(), c_int> {
+    if !section_inside(h.signature_off, h.signature_len, n)
+        || !section_inside(h.metadata_off, h.metadata_len, n)
+        || !section_inside(h.data_off, h.data_len, n)
+        || h.signature_len == 0
+    {
+        return Err(-EINVAL);
+    }
+    match h.ty {
+        TYPE_BPF => validate_bpf_bounds(h, n),
+        TYPE_JAVA => validate_java_bounds(h),
+        _ => Err(-EINVAL),
+    }
 }
 
 /// Whether `path` is an absolute policy-label path of at most 255 bytes
@@ -578,6 +603,20 @@ fn parse_signed_sections(data: &[u8], data_off: usize, nr_maps: u32) -> Option<S
                 });
                 16
             }
+            SECTION_TYPE => {
+                if len != 4 {
+                    return None;
+                }
+                signed.ty = Some(at);
+                32
+            }
+            SECTION_JAR => {
+                if len == 0 {
+                    return None;
+                }
+                signed.jar = Some(at);
+                64
+            }
             _ => return None,
         };
         if seen & bit != 0 {
@@ -600,7 +639,14 @@ impl<'a> Upatch<'a> {
         let data = &bytes[hdr.data_off as usize..][..hdr.data_len as usize];
         let signed =
             parse_signed_sections(data, hdr.data_off as usize, hdr.nr_maps).unwrap_or_default();
-        Ok(Upatch { hdr, bytes, signed })
+        let upatch = Upatch { hdr, bytes, signed };
+        // The header is unsigned. Its type must be bound by the signed
+        // sections before it chooses the verifier. Legacy BPF payloads
+        // have no TYPE section and therefore default to BPF.
+        if upatch.signed_type() != upatch.hdr.ty {
+            return Err(-EINVAL);
+        }
+        Ok(upatch)
     }
 
     /// The container in `bytes`, which it borrows: -EINVAL for one the
@@ -792,9 +838,26 @@ impl Upatch<'_> {
         self.hdr.flags & DIRECTIVE_UNLOAD != 0
     }
 
-    /// What the payload is: a BPF program, the one kind there is.
+    /// The signed payload type, BPF for legacy payloads without a TYPE
+    /// section.
+    pub(crate) fn signed_type(&self) -> u32 {
+        self.signed_section(self.signed.ty.as_ref())
+            .map(|ty| le32(ty, 0))
+            .unwrap_or(TYPE_BPF)
+    }
+
+    /// The signed Java agent jar.
+    pub(crate) fn signed_jar(&self) -> Option<&[u8]> {
+        self.signed_section(self.signed.jar.as_ref())
+    }
+
+    pub(crate) fn is_java(&self) -> bool {
+        self.hdr.ty == TYPE_JAVA
+    }
+
+    /// What the payload is: a BPF program or a Java agent.
     pub(crate) fn payload_type(&self) -> &'static [u8] {
-        b"bpf"
+        if self.is_java() { b"java" } else { b"bpf" }
     }
 }
 
