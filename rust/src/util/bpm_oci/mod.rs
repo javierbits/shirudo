@@ -54,12 +54,9 @@ pub struct BpmBuffer {
     cap: usize,
 }
 
-/// `struct bpm_http_response`.
-#[repr(C)]
-pub struct HttpResponse {
+struct HttpResponse {
     body: BpmBuffer,
     www_auth: [u8; 2048],
-    content_type: [u8; MAX_MEDIA],
     location: [u8; PATH_MAX],
     status: c_long,
 }
@@ -86,7 +83,6 @@ pub struct Descriptor {
 }
 
 const _: () = assert!(size_of::<BpmBuffer>() == 24);
-const _: () = assert!(size_of::<HttpResponse>() == 6368);
 const _: () = assert!(size_of::<OciClient>() == 13568);
 const _: () = assert!(size_of::<Descriptor>() == 4424);
 
@@ -105,7 +101,6 @@ impl HttpResponse {
         HttpResponse {
             body: BpmBuffer::new(),
             www_auth: [0; 2048],
-            content_type: [0; MAX_MEDIA],
             location: [0; PATH_MAX],
             status: 0,
         }

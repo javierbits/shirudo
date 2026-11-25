@@ -32,29 +32,18 @@ fuzz_target!(
 );
 
 fuzz_target!(shirudo_fuzz_oci_http, shirudo_fuzz_oci_http_init, |data| {
-    // SAFETY: a response of nothing, for which zeros are the value.
-    let mut r: Box<HttpResponse> = Box::new(unsafe { core::mem::zeroed() });
+    let mut r = HttpResponse::new();
     // Each header line in a buffer of its own, end included, as curl
     // hands the callback one.
     for line in data.split_inclusive(|&b| b == b'\n') {
-        let mut line = line.to_vec();
-        // SAFETY: the line's bytes and the response, as curl passes them.
-        unsafe {
-            http::header(
-                line.as_mut_ptr().cast(),
-                1,
-                line.len(),
-                (&raw mut *r).cast(),
-            )
-        };
+        http::header_line(&mut r, line);
     }
-    let (mut realm, mut service, mut scope) = ([0; PATH_MAX], [0; 256], [0; 512]);
-    auth::parse_challenge(cstr(&r.www_auth), &mut realm, &mut service, &mut scope);
+    let _ = auth::parse_challenge(cstr(&r.www_auth));
     let mut c = Client::new();
     copy_string(&mut c.as_mut().base_url, b"https://registry.example:5000");
     let mut upload = [0; PATH_MAX];
     refs::upload_location(c.as_mut(), cstr(&r.location), &mut upload);
-    auth::token_from_body(cstr(data), &mut c.as_mut().token);
+    let _ = auth::token_from_body(data, &mut c.as_mut().token);
 });
 
 fn oci_ref_init() {
@@ -98,7 +87,10 @@ fuzz_target!(
             return;
         };
         env("REGISTRY_AUTH_FILE", Some(&input.path.to_string_lossy()));
-        let _ = Client::new().parse_endpoint(b"oci://registry.example:5000");
+        let result = Client::new().parse_endpoint(b"oci://registry.example:5000");
+        if data.len() <= 4 * 1024 * 1024 && data.contains(&0) {
+            assert_eq!(result, Err(-crate::errno::EINVAL));
+        }
     },
     registry_auth_init
 );

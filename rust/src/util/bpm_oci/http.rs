@@ -6,9 +6,12 @@
 
 use core::ffi::{CStr, c_char, c_int, c_long, c_void};
 use core::ptr;
+use std::ffi::CString;
 use std::os::fd::BorrowedFd;
 
-use super::auth::{encode_basic, parse_challenge, token_from_body};
+use super::auth::{
+    BearerChallenge, challenge_params, encode_basic, parse_challenge, token_from_body,
+};
 use super::refs::{upload_location, url};
 use super::{
     AUTH_VALUE_SIZE, BASIC_ENCODED_SIZE, BASIC_HEADER_SIZE, BpmBuffer, Descriptor, HttpResponse,
@@ -164,21 +167,18 @@ fn skip_space(s: &[u8]) -> &[u8] {
     &s[n..]
 }
 
-/// What a response header tells the client: the auth challenge, the
-/// content type and an upload's location.
+/// What a response header tells the client: the auth challenge or
+/// an upload's location.
 pub(super) fn header_line(r: &mut HttpResponse, line: &[u8]) {
+    const HEADER_LINE_MAX: usize = 4096;
+
+    if line.len() >= HEADER_LINE_MAX || line.contains(&0) {
+        return;
+    }
     if starts_with_ci(line, b"WWW-Authenticate:") {
         if strscpy(&mut r.www_auth, skip_space(&line[17..])).is_err() {
             r.www_auth[0] = 0;
         }
-    } else if starts_with_ci(line, b"Content-Type:") {
-        let v = skip_space(&line[13..]);
-        let end = v
-            .iter()
-            .position(|c| b" ;\r\n".contains(c))
-            .unwrap_or(v.len());
-
-        copy_string(&mut r.content_type, &v[..end]);
     } else if starts_with_ci(line, b"Location:") {
         let v = skip_space(&line[9..]);
         let end = v
@@ -190,17 +190,15 @@ pub(super) fn header_line(r: &mut HttpResponse, line: &[u8]) {
     }
 }
 
-pub(super) unsafe extern "C" fn header(
+unsafe extern "C" fn header(
     data: *mut c_char,
     size: usize,
     nmemb: usize,
     ud: *mut c_void,
 ) -> usize {
-    let n = size.wrapping_mul(nmemb);
-
-    if n >= 4096 {
-        return n;
-    }
+    let Some(n) = size.checked_mul(nmemb) else {
+        return 0;
+    };
     // SAFETY: curl hands over n bytes at data, and the response the
     // request set as its header data.
     let (data, r) = unsafe {
@@ -209,7 +207,7 @@ pub(super) unsafe extern "C" fn header(
             &mut *ud.cast::<HttpResponse>(),
         )
     };
-    header_line(r, cstr(data));
+    header_line(r, data);
     n
 }
 
@@ -392,10 +390,6 @@ fn log_failure(url: &CStr, errbuf: &[u8; CURL_ERROR_SIZE], cc: CurlCode) {
 /// token server the challenge names, asked with Basic credentials when
 /// the client has them.
 fn get_bearer_token(c: &mut OciClient, challenge: &[u8]) -> c_int {
-    let mut realm = [0u8; PATH_MAX];
-    let mut service = [0u8; 256];
-    let mut scope = [0u8; 512];
-
     if let Some(token) = libc::env(c"BPM_OCI_BEARER_TOKEN").filter(|t| !t.is_empty()) {
         if token.to_bytes().len() >= c.token.len() {
             return -E2BIG;
@@ -403,80 +397,53 @@ fn get_bearer_token(c: &mut OciClient, challenge: &[u8]) -> c_int {
         copy_string(&mut c.token, token.to_bytes());
         return 0;
     }
-    if parse_challenge(challenge, &mut realm, &mut service, &mut scope) != 0 {
+    let Ok(challenge) = parse_challenge(challenge) else {
         return -EINVAL;
-    }
-    let mut basic = [0u8; BASIC_ENCODED_SIZE];
-    let mut auth_header = [0u8; BASIC_HEADER_SIZE];
-    let mut headers = Slist::default();
+    };
     let mut r = HttpResponse::new();
+    let ret = token_exchange(c, &challenge, &mut r);
 
-    let ret = token_exchange(
-        c,
-        &realm,
-        &service,
-        &scope,
-        &mut basic,
-        &mut auth_header,
-        &mut headers,
-        &mut r,
-    );
-    scrub(&mut basic);
-    scrub(&mut auth_header);
     buffer_free(&mut r.body);
-    ret
+    ret.err().unwrap_or(0)
 }
 
-#[allow(clippy::too_many_arguments)]
+fn token_url(easy: &Easy<'_>, challenge: &BearerChallenge<'_>) -> Result<CString, c_int> {
+    let service = CString::new(challenge.service).map_err(|_| -EINVAL)?;
+    let scope = CString::new(challenge.scope).map_err(|_| -EINVAL)?;
+    let service = easy.escape(&service).ok_or(-EINVAL)?;
+    let scope = easy.escape(&scope).ok_or(-EINVAL)?;
+    let url = [challenge.realm, b"?service=", &service, b"&scope=", &scope].concat();
+    if url.len() >= PATH_MAX * 2 {
+        return Err(-ENAMETOOLONG);
+    }
+    CString::new(url).map_err(|_| -EINVAL)
+}
+
+fn token_headers(c: &OciClient) -> Result<Slist, c_int> {
+    let mut headers = Slist::default();
+
+    if c.username[0] != 0 {
+        let mut auth = [0; AUTH_VALUE_SIZE];
+        let ret = basic_auth(c, &mut auth);
+        let result = if ret == 0 {
+            append_header::<BASIC_HEADER_SIZE>(&mut headers, b"Authorization: ", cstr(&auth))
+        } else {
+            Err(ret)
+        };
+        scrub(&mut auth);
+        result?;
+    }
+    Ok(headers)
+}
+
 fn token_exchange(
     c: &mut OciClient,
-    realm: &[u8],
-    service: &[u8],
-    scope: &[u8],
-    basic: &mut [u8],
-    auth_header: &mut [u8],
-    headers: &mut Slist,
+    challenge: &BearerChallenge<'_>,
     r: &mut HttpResponse,
-) -> c_int {
-    let mut url = [0u8; PATH_MAX * 2];
-    let mut ret = -EINVAL;
-    let mut easy = match Easy::new() {
-        Ok(easy) => easy,
-        Err(err) => return err,
-    };
-
-    let esc_service = easy.escape(as_cstr(service));
-    let esc_scope = easy.escape(as_cstr(scope));
-    let (Some(esc_service), Some(esc_scope)) = (esc_service, esc_scope) else {
-        return ret;
-    };
-    if strsprintf(
-        &mut url,
-        &[
-            cstr(realm),
-            b"?service=",
-            &esc_service,
-            b"&scope=",
-            &esc_scope,
-        ],
-    )
-    .is_err()
-    {
-        return -ENAMETOOLONG;
-    }
-    if c.username[0] != 0 {
-        ret = encode_basic(cstr(&c.username), cstr(&c.password), basic);
-        if ret != 0 {
-            return ret;
-        }
-        if strsprintf(auth_header, &[b"Authorization: Basic ", cstr(basic)]).is_err() {
-            return -E2BIG;
-        }
-        ret = headers.append(cstr(auth_header));
-        if ret != 0 {
-            return ret;
-        }
-    }
+) -> Result<(), c_int> {
+    let headers = token_headers(c)?;
+    let mut easy = Easy::new()?;
+    let url = token_url(&easy, challenge)?;
     // The realm is the registry's to name and the credentials go there:
     // over no weaker a transport than the registry's own.
     let protocols: &CStr = if c.base_url.starts_with(b"https://") {
@@ -484,10 +451,10 @@ fn token_exchange(
     } else {
         c"http,https"
     };
-    easy.set_str(CURLOPT_URL, as_cstr(&url));
+    easy.set_str(CURLOPT_URL, &url);
     easy.set_str(CURLOPT_PROTOCOLS_STR, protocols);
     easy.set_long(CURLOPT_HTTPGET, 1);
-    easy.set_headers(headers);
+    easy.set_headers(&headers);
     easy.set_long(CURLOPT_NOSIGNAL, 1);
     deadlines(&mut easy, MAX_HTTP_BODY as u64);
     // SAFETY: write_memory() takes its data for the response, which
@@ -497,36 +464,32 @@ fn token_exchange(
     easy.set_long(CURLOPT_SSL_VERIFYPEER, 1);
     easy.set_long(CURLOPT_SSL_VERIFYHOST, 2);
     if tls_curl_policy(&mut easy, Some(as_cstr(&c.ca_file))).is_err() {
-        return -EINVAL;
+        return Err(-EINVAL);
     }
     let cc = easy.perform();
     if let Some(status) = easy.response_code() {
         r.status = status;
     }
     if cc != CURLE_OK {
-        return -EHOSTUNREACH;
+        return Err(-EHOSTUNREACH);
     }
     if r.status >= 300 {
-        return -EACCES;
+        return Err(-EACCES);
     }
-    // curl never calls the write callback for an empty body.
-    if r.body.data.is_null() {
-        return ret;
-    }
-    token_from_body(cstr(buffer_bytes(&r.body)), &mut c.token)
+    token_from_body(buffer_bytes(&r.body), &mut c.token)
 }
 
 /// The value of the Authorization header that answers the challenge of
 /// `r`: a Bearer token, Basic credentials, or -EACCES for anything else.
 fn answer_challenge(c: &mut OciClient, www_auth: &[u8], auth: &mut [u8]) -> c_int {
-    if starts_with_ci(www_auth, b"Bearer") {
+    if challenge_params(www_auth, b"Bearer").is_some() {
         let ret = get_bearer_token(c, www_auth);
 
         if ret == 0 && strsprintf(auth, &[b"Bearer ", cstr(&c.token)]).is_err() {
             return -E2BIG;
         }
         ret
-    } else if starts_with_ci(www_auth, b"Basic") && c.username[0] != 0 {
+    } else if challenge_params(www_auth, b"Basic").is_some() && c.username[0] != 0 {
         basic_auth(c, auth)
     } else {
         -EACCES
@@ -640,7 +603,10 @@ pub(super) fn get_file(
     ret = curl_once(c, &req, None, &mut r, Some(&mut sink), true);
     let www_auth = r.www_auth;
     let challenge = cstr(&www_auth);
-    if ret == 0 && r.status == 401 && !challenge.is_empty() && starts_with_ci(challenge, b"Bearer")
+    if ret == 0
+        && r.status == 401
+        && !challenge.is_empty()
+        && challenge_params(challenge, b"Bearer").is_some()
     {
         ret = sink_restart(&mut sink, fd, size as u64);
         if ret == 0 {
@@ -657,7 +623,7 @@ pub(super) fn get_file(
     } else if ret == 0
         && r.status == 401
         && !challenge.is_empty()
-        && starts_with_ci(challenge, b"Basic")
+        && challenge_params(challenge, b"Basic").is_some()
         && c.username[0] != 0
     {
         ret = sink_restart(&mut sink, fd, size as u64);

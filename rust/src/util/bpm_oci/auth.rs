@@ -10,9 +10,10 @@ use super::{
     BASIC_RAW_SIZE, MAX_ENDPOINT, OciClient, PATH_MAX, at, cstr, find, is_space, strscpy,
     strsprintf,
 };
-use crate::errno::{E2BIG, EINVAL, ENAMETOOLONG, ENOENT, ENOSPC};
+use crate::errno::{E2BIG, EINVAL, ENAMETOOLONG, ENOENT, ENOMEM, ENOSPC};
 use crate::sys::libc;
 use crate::util::io;
+use crate::util::json::{JsonField, parse_schema};
 
 const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -179,13 +180,15 @@ pub(super) fn load_registry_auth(registry: &[u8], c: &mut OciClient) -> c_int {
         Ok(body) => body,
         Err(err) => return if err == -ENOENT { 0 } else { err },
     };
-    // As a C string: up to the first NUL.
-    auth_entry(cstr(&body), cstr(&needle), c)
+    auth_entry(&body, cstr(&needle), c)
 }
 
 /// The auth file is local input; the registry key and its auth member
 /// must sit in one JSON object before the credentials count.
-fn auth_entry(text: &[u8], needle: &[u8], c: &mut OciClient) -> c_int {
+pub(super) fn auth_entry(text: &[u8], needle: &[u8], c: &mut OciClient) -> c_int {
+    if text.contains(&0) {
+        return -EINVAL;
+    }
     let Some(p) = find(text, needle) else {
         return 0;
     };
@@ -210,88 +213,86 @@ fn auth_entry(text: &[u8], needle: &[u8], c: &mut OciClient) -> c_int {
     decode_basic(&rest[i + 1..], &mut c.username, &mut c.password)
 }
 
-/// The realm, service and scope of a `Bearer` challenge; -EINVAL without
-/// a realm, -ENAMETOOLONG for one that does not fit.
-pub(super) fn parse_challenge(
-    header: &[u8],
-    realm: &mut [u8],
-    service: &mut [u8],
-    scope: &mut [u8],
-) -> c_int {
-    let Some(prefix) = header.get(..6) else {
-        return -EINVAL;
-    };
-    let mut p = 6;
-
-    if !prefix.eq_ignore_ascii_case(b"Bearer") {
-        return -EINVAL;
-    }
-    while p < header.len() {
-        while matches!(at(header, p), b' ' | b',') {
-            p += 1;
-        }
-        let rest = &header[p..];
-        let field: Option<(usize, &mut [u8])> = if rest.starts_with(b"realm=\"") {
-            Some((7, &mut *realm))
-        } else if rest.starts_with(b"service=\"") {
-            Some((9, &mut *service))
-        } else if rest.starts_with(b"scope=\"") {
-            Some((7, &mut *scope))
-        } else {
-            None
-        };
-        match field {
-            Some((skip, dst)) => {
-                let value = &rest[skip..];
-                let Some(q) = value.iter().position(|&c| c == b'"') else {
-                    return -EINVAL;
-                };
-                if q >= dst.len() {
-                    return -ENAMETOOLONG;
-                }
-                dst[..q].copy_from_slice(&value[..q]);
-                dst[q] = 0;
-                p += skip + q + 1;
-            }
-            None => match rest.iter().position(|&c| c == b',') {
-                Some(comma) => p += comma,
-                None => break,
-            },
-        }
-    }
-    if at(realm, 0) != 0 { 0 } else { -EINVAL }
+/// The parameters of a challenge with the given, complete scheme.
+pub(super) fn challenge_params<'a>(header: &'a [u8], scheme: &[u8]) -> Option<&'a [u8]> {
+    let (head, rest) = header.split_at_checked(scheme.len())?;
+    (head.eq_ignore_ascii_case(scheme) && (rest.is_empty() || rest.starts_with(b" ")))
+        .then_some(rest)
 }
 
-/// The token in a token server's JSON answer, `token` or `access_token`.
-pub(super) fn token_from_body(body: &[u8], out: &mut [u8]) -> c_int {
-    let Some(key) = find(body, b"\"token\"").or_else(|| find(body, b"\"access_token\"")) else {
-        return -EINVAL;
-    };
-    let Some(colon) = body[key..].iter().position(|&c| c == b':') else {
-        return -EINVAL;
-    };
-    let mut i = key + colon + 1;
-    while i < body.len() && is_space(body[i]) {
-        i += 1;
+#[derive(Default)]
+pub(super) struct BearerChallenge<'a> {
+    pub realm: &'a [u8],
+    pub service: &'a [u8],
+    pub scope: &'a [u8],
+}
+
+pub(super) fn parse_challenge(header: &[u8]) -> Result<BearerChallenge<'_>, c_int> {
+    let mut fields = BearerChallenge::default();
+    let mut params = challenge_params(header, b"Bearer").ok_or(-EINVAL)?;
+
+    while !params.is_empty() {
+        let start = params
+            .iter()
+            .take_while(|&&c| matches!(c, b' ' | b','))
+            .count();
+        params = &params[start..];
+        let (value, field, cap) = if let Some(value) = params.strip_prefix(b"realm=\"") {
+            (value, &mut fields.realm, PATH_MAX)
+        } else if let Some(value) = params.strip_prefix(b"service=\"") {
+            (value, &mut fields.service, 256)
+        } else if let Some(value) = params.strip_prefix(b"scope=\"") {
+            (value, &mut fields.scope, 512)
+        } else {
+            let Some(comma) = params.iter().position(|&c| c == b',') else {
+                break;
+            };
+            params = &params[comma + 1..];
+            continue;
+        };
+        let end = value.iter().position(|&c| c == b'"').ok_or(-EINVAL)?;
+        if end >= cap {
+            return Err(-ENAMETOOLONG);
+        }
+        *field = &value[..end];
+        params = &value[end + 1..];
     }
-    if at(body, i) != b'"' {
-        return -EINVAL;
+
+    if fields.realm.is_empty() {
+        return Err(-EINVAL);
     }
-    let token = &body[i + 1..];
-    let Some(end) = token.iter().position(|&c| c == b'"') else {
-        return -EINVAL;
+    Ok(fields)
+}
+
+/// The token server's own token member, falling back to access_token.
+pub(super) fn token_from_body(body: &[u8], out: &mut [u8]) -> Result<(), c_int> {
+    if body.contains(&0) || out.is_empty() {
+        return Err(-EINVAL);
+    }
+    let room = out.len().checked_mul(2).ok_or(-ENOMEM)?;
+    let mut storage = Vec::new();
+    storage.try_reserve_exact(room).map_err(|_| -ENOMEM)?;
+    storage.resize(room, 0);
+    let mut tokens = storage.split_at_mut(out.len());
+    let fields = [
+        JsonField::string(c"token", |tokens: &mut (&mut [u8], &mut [u8])| tokens.0),
+        JsonField::string(c"access_token", |tokens| tokens.1),
+    ];
+
+    parse_schema(body, &fields, &mut tokens).map_err(|_| -EINVAL)?;
+    let token = if fields[0].seen() {
+        cstr(tokens.0)
+    } else if fields[1].seen() {
+        cstr(tokens.1)
+    } else {
+        return Err(-EINVAL);
     };
-    if end >= out.len() {
-        return -EINVAL;
-    }
-    // It goes into a header line as it is: no line break, no escape.
-    if token[..end]
+    // The decoded token goes straight into the Authorization header.
+    if token
         .iter()
-        .any(|&c| c < 0x21 || c == b'\\' || c == 0x7f)
+        .any(|&c| c < 0x21 || matches!(c, b'"' | b'\\' | 0x7f))
     {
-        return -EINVAL;
+        return Err(-EINVAL);
     }
-    out[..end].copy_from_slice(&token[..end]);
-    out[end] = 0;
-    0
+    strscpy(out, token).map(|_| ())
 }
