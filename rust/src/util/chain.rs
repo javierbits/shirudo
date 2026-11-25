@@ -24,7 +24,7 @@ use crate::util::tpm::{Branches, NvInfo, REGISTER_ATTRS, Tpm};
 use crate::util::tpm_wire::{
     DIGEST_LEN, NAME_LEN, NV_RSA_BYTES, RegisterPolicy, nv_name, register_policy,
 };
-use crate::util::upatch::{NAME_MAX, PAYLOAD_HASH_LEN};
+use crate::util::upatch::{NAME_MAX, PAYLOAD_HASH_LEN, TYPE_BPF, TYPE_JAVA};
 
 /// `CHAIN_NAME`, the register's name in its anchor.
 const CHAIN_NAME: &[u8] = b"shirudo";
@@ -43,6 +43,7 @@ pub(crate) const ANCHOR_MAX: usize = 128;
 pub struct MeasuredUpatch {
     pub(crate) name: [u8; NAME_MAX + 1],
     pub(crate) payload_hex: [u8; 2 * PAYLOAD_HASH_LEN + 1],
+    pub(crate) ty: u32,
 }
 
 /// `struct chain_init_info`: the binding chain_init() made or found.
@@ -113,7 +114,7 @@ impl ChainStatus {
     }
 }
 
-const _: () = assert!(size_of::<MeasuredUpatch>() == 322);
+const _: () = assert!(size_of::<MeasuredUpatch>() == 328);
 const _: () = assert!(size_of::<ChainInitInfo>() == 696);
 const _: () = assert!(core::mem::offset_of!(ChainInitInfo, reset_count) == 388);
 const _: () = assert!(core::mem::offset_of!(ChainInitInfo, name_len) == 528);
@@ -205,8 +206,8 @@ fn digest_into(parts: &[&[u8]], out: &mut [u8; DIGEST_LEN]) -> c_int {
 }
 
 /// The init event: the set sorted by name, its listing of one
-/// "<payload hex> <name>\n" line a member, whose digest goes into
-/// `set_digest`, and the digest of the tag, `cert_sha`, the listing's
+/// "[java ]<payload hex> <name>\n" line a member, whose digest goes
+/// into `set_digest`, and the digest of the tag, `cert_sha`, the listing's
 /// and `tree_root` into `event`. Both are zeros when it fails.
 pub(crate) fn init_event(
     cert_sha: &[u8; DIGEST_LEN],
@@ -220,7 +221,20 @@ pub(crate) fn init_event(
     *event = [0; DIGEST_LEN];
     let listing: Vec<u8> = set
         .iter()
-        .flat_map(|m| [cstr(&m.payload_hex), b" ", cstr(&m.name), b"\n"].concat())
+        .flat_map(|m| {
+            [
+                if m.ty == TYPE_JAVA {
+                    &b"java "[..]
+                } else {
+                    &b""[..]
+                },
+                cstr(&m.payload_hex),
+                b" ",
+                cstr(&m.name),
+                b"\n",
+            ]
+            .concat()
+        })
         .collect();
     let ret = digest_into(&[&listing], set_digest);
     if ret != 0 {
@@ -240,6 +254,17 @@ pub(crate) fn key_event(
     event: &mut [u8; DIGEST_LEN],
 ) -> c_int {
     digest_into(&[tag.to_bytes_with_nul(), cert_sha], event)
+}
+
+/// The domain tag of a BPF or Java load or unload.
+pub(crate) fn upatch_tag(ty: u32, load: bool) -> Option<&'static CStr> {
+    match (ty, load) {
+        (TYPE_BPF, true) => Some(c"shirudo-upatch"),
+        (TYPE_BPF, false) => Some(c"shirudo-unload"),
+        (TYPE_JAVA, true) => Some(c"shirudo-java"),
+        (TYPE_JAVA, false) => Some(c"shirudo-java-unload"),
+        _ => None,
+    }
 }
 
 /// The event of a upatch loaded or unloaded: the digest of `tag` and its

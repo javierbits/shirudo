@@ -15,7 +15,7 @@ use crate::util::chain::MeasuredUpatch;
 use crate::util::eventlog::{self, UPATCH_INIT, UPATCH_UNLOAD};
 use crate::util::hex::{self, hex_encode};
 use crate::util::seal;
-use crate::util::upatch::{NAME_MAX, PAYLOAD_HASH_LEN, Upatch, member_valid};
+use crate::util::upatch::{NAME_MAX, PAYLOAD_HASH_LEN, TYPE_BPF, TYPE_JAVA, Upatch, member_valid};
 
 /// `MEASURED_MAX`: the most upatches a set holds.
 const MEASURED_MAX: usize = 4096;
@@ -109,6 +109,7 @@ impl MeasuredSet {
 const NO_MEMBER: MeasuredUpatch = MeasuredUpatch {
     name: [0; NAME_MAX + 1],
     payload_hex: [0; 2 * PAYLOAD_HASH_LEN + 1],
+    ty: 0,
 };
 
 /// The member an init record lists for the upatch `u`: its header's name
@@ -119,7 +120,18 @@ pub(crate) fn upatch_of(u: &Upatch) -> MeasuredUpatch {
 
     member.name[..name.len()].copy_from_slice(name);
     member.payload_hex[..payload_hex.len()].copy_from_slice(&payload_hex);
+    member.ty = u.hdr.ty;
     member
+}
+
+/// The optional type field of an init record member: absent means the
+/// legacy BPF type.
+pub(crate) fn member_type(text: &[u8]) -> Result<u32, c_int> {
+    match text {
+        b"" => Ok(TYPE_BPF),
+        b"java" => Ok(TYPE_JAVA),
+        _ => Err(-EINVAL),
+    }
 }
 
 /// `name` with `payload_hex` added to `set`, which holds at most `max`:
@@ -130,6 +142,7 @@ pub(crate) fn set_add(
     max: usize,
     name: &[u8],
     payload_hex: &[u8],
+    ty: u32,
 ) -> Result<(), c_int> {
     if !member_valid(name, payload_hex) {
         return Err(-EINVAL);
@@ -140,12 +153,16 @@ pub(crate) fn set_add(
     if set.len() >= max {
         return Err(-E2BIG);
     }
+    if crate::util::chain::upatch_tag(ty, true).is_none() {
+        return Err(-EINVAL);
+    }
     let mut member = NO_MEMBER;
     if strscpy(&mut member.name, name).is_err()
         || strscpy(&mut member.payload_hex, payload_hex).is_err()
     {
         return Err(-E2BIG);
     }
+    member.ty = ty;
     set.push(member);
     Ok(())
 }
@@ -311,7 +328,7 @@ mod verified {
     use core::ffi::c_int;
     use std::ffi::CString;
 
-    use super::{MEASURED_MAX, set_add};
+    use super::{MEASURED_MAX, member_type, set_add};
     use crate::errno::{EBADMSG, EINVAL, ENOENT, ENOMEM};
     use crate::text::cstr;
     use crate::util::chain::{
@@ -368,6 +385,7 @@ mod verified {
         operation: [u8; 72],
         name: [u8; NAME_MAX + 1],
         payload_hex: [u8; 2 * PAYLOAD_HASH_LEN + 1],
+        member_type: [u8; 8],
         seq: i64,
         set: Vec<MeasuredUpatch>,
         init: bool,
@@ -382,9 +400,11 @@ mod verified {
             MEASURED_MAX,
             cstr(&r.name),
             cstr(&r.payload_hex),
+            member_type(cstr(&r.member_type))?,
         );
         r.name[0] = 0;
         r.payload_hex[0] = 0;
+        r.member_type[0] = 0;
         added
     }
 
@@ -392,6 +412,7 @@ mod verified {
         let entry = [
             JsonField::string(c"name", |r: &mut Record| &mut r.name),
             JsonField::string(c"payload_sha256", |r| &mut r.payload_hex),
+            JsonField::string(c"type", |r| &mut r.member_type),
         ];
         let upatch = [
             JsonField::string(c"name", |r: &mut Record| &mut r.name),
@@ -454,16 +475,13 @@ mod verified {
                         event.as_mut_ptr(),
                     )
                 }
-                b"upatch_load" | b"upatch_unload" => {
+                b"upatch_load" | b"upatch_unload" | b"java_load" | b"java_unload" => {
                     if !r.upatch || !member_valid(cstr(&r.name), cstr(&r.payload_hex)) {
                         return Err(-EINVAL);
                     }
                     let payload = decode32(&r.payload_hex)?;
-                    let tag = if ty == b"upatch_load" {
-                        c"shirudo-upatch"
-                    } else {
-                        c"shirudo-unload"
-                    };
+                    let (payload_type, load) = eventlog::upatch_record_parse(ty).ok_or(-EINVAL)?;
+                    let tag = chain::upatch_tag(payload_type, load).ok_or(-EINVAL)?;
                     chain_upatch_event(
                         tag.as_ptr(),
                         r.name.as_ptr().cast(),
@@ -510,6 +528,7 @@ mod verified {
             operation: [0; 72],
             name: [0; NAME_MAX + 1],
             payload_hex: [0; 2 * PAYLOAD_HASH_LEN + 1],
+            member_type: [0; 8],
             seq: 0,
             set,
             init: false,

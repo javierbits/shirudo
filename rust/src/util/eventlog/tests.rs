@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::testutil::TempDir;
+use crate::util::upatch::{TYPE_BPF, TYPE_JAVA};
 
 /// This thread's log, in `dir`.
 fn use_log(dir: &TempDir) {
@@ -121,6 +122,7 @@ fn tree_op_measured_this_boot() {
 struct Seen {
     inits: i32,
     loads: i32,
+    unloads: i32,
     last: Vec<u8>,
 }
 
@@ -132,6 +134,7 @@ fn count_upatches(s: &mut Seen) -> c_int {
             return 0;
         }
         s.loads += c_int::from(event == records::UPATCH_LOAD);
+        s.unloads += c_int::from(event == UPATCH_UNLOAD);
         s.last = name.to_vec();
         0
     })
@@ -160,7 +163,63 @@ fn set_counts_in_an_init_record_alone() {
         &set_record(b"key_revoke", b"ghost"),
     ]));
     assert_eq!(count_upatches(&mut s), 0);
-    assert_eq!((s.inits, s.loads, s.last.as_slice()), (1, 1, &b"fix"[..]));
+    assert_eq!(
+        (s.inits, s.loads, s.unloads, s.last.as_slice()),
+        (1, 1, 0, &b"fix"[..])
+    );
     write_log(&lines(&[&set_record(b"init", b"../fix")]));
     assert_eq!(count_upatches(&mut s), -EINVAL);
+}
+
+fn upatch_event_record(ty: &[u8], name: &[u8]) -> Vec<u8> {
+    record(ty, 3, |e| {
+        e.obj_open_key(b"upatch");
+        e.kv_string(b"name", name);
+        e.kv_string(b"payload_sha256", DIGEST_HEX);
+        e.obj_close();
+    })
+}
+
+#[test]
+fn upatch_records_name_type_and_direction() {
+    assert_eq!(
+        records::upatch_record(TYPE_BPF, true),
+        Some(&b"upatch_load"[..])
+    );
+    assert_eq!(
+        records::upatch_record(TYPE_JAVA, false),
+        Some(&b"java_unload"[..])
+    );
+    assert_eq!(records::upatch_record(3, true), None);
+    assert_eq!(
+        records::upatch_record_parse(b"java_load"),
+        Some((TYPE_JAVA, true))
+    );
+    assert_eq!(
+        records::upatch_record_parse(b"upatch_unload"),
+        Some((TYPE_BPF, false))
+    );
+    assert_eq!(records::upatch_record_parse(b"java_loa"), None);
+    assert_eq!(records::upatch_record_parse(b"upatch_load "), None);
+    assert_eq!(
+        records::upatch_kind_parse(b"java-unload"),
+        Some((TYPE_JAVA, false))
+    );
+}
+
+#[test]
+fn java_records_count_as_upatch_events() {
+    let dir = TempDir::new();
+    use_log(&dir);
+    let mut s = Seen::default();
+    let init = set_record(b"init", b"fix");
+    let load = upatch_event_record(b"java_load", b"agent");
+    let unload = upatch_event_record(b"java_unload", b"agent");
+
+    write_log(&lines(&[&init, &load, &unload]));
+    assert_eq!(count_upatches(&mut s), 0);
+    assert_eq!(
+        (s.inits, s.loads, s.unloads, s.last.as_slice()),
+        (1, 2, 1, &b"agent"[..])
+    );
 }

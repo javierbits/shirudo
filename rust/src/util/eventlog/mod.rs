@@ -13,9 +13,11 @@ mod records;
 
 #[cfg(test)]
 pub(crate) use records::UPATCH_LOAD;
+#[cfg(feature = "test-helpers")]
+pub(crate) use records::upatch_record;
 pub(crate) use records::{
     EventlogInit, UPATCH_INIT, UPATCH_UNLOAD, UpatchFn, boot_init, boot_lines, replay,
-    tree_op_measured, upatches, upatches_record,
+    tree_op_measured, upatch_kind_parse, upatch_record_parse, upatches, upatches_record,
 };
 
 use core::ffi::{CStr, c_int};

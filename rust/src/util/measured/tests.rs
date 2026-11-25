@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::util::eventlog::UPATCH_LOAD;
+use crate::util::upatch::{TYPE_BPF, TYPE_JAVA};
 
 const PAYLOAD: &CStr = c"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
@@ -11,18 +12,54 @@ const PAYLOAD: &CStr = c"00112233445566778899aabbccddeeff00112233445566778899aab
 fn set_takes_each_upatch_once() {
     let p = PAYLOAD.to_bytes();
     let mut set = Vec::new();
-    let mut add = |name: &[u8], payload: &[u8]| set_add(&mut set, 2, name, payload);
+    let mut add = |name: &[u8], payload: &[u8], ty| set_add(&mut set, 2, name, payload, ty);
     let crafted = [&b"a\n"[..], p, b" b"].concat();
 
-    assert_eq!(add(b"a", p), Ok(()));
-    assert_eq!(add(b"a", p), Err(-EEXIST));
-    assert_eq!(add(&crafted, p), Err(-EINVAL));
-    assert_eq!(add(b"b", b"00"), Err(-EINVAL));
-    assert_eq!(add(b"b", p), Ok(()));
-    assert_eq!(add(b"c", p), Err(-E2BIG));
+    assert_eq!(add(b"a", p, TYPE_BPF), Ok(()));
+    assert_eq!(add(b"a", p, TYPE_BPF), Err(-EEXIST));
+    assert_eq!(add(b"a", p, TYPE_JAVA), Err(-EEXIST));
+    assert_eq!(add(&crafted, p, TYPE_BPF), Err(-EINVAL));
+    assert_eq!(add(b"b", b"00", TYPE_BPF), Err(-EINVAL));
+    assert_eq!(add(b"b", p, 3), Err(-EINVAL));
+    assert_eq!(add(b"b", p, TYPE_JAVA), Ok(()));
+    assert_eq!(add(b"c", p, TYPE_BPF), Err(-E2BIG));
     assert_eq!(set.len(), 2);
     assert_eq!(cstr(&set[0].name), b"a");
+    assert_eq!(set[0].ty, TYPE_BPF);
     assert_eq!(cstr(&set[1].payload_hex), p);
+    assert_eq!(set[1].ty, TYPE_JAVA);
+}
+
+#[test]
+fn member_type_is_bpf_or_java() {
+    assert_eq!(member_type(b""), Ok(TYPE_BPF));
+    assert_eq!(member_type(b"java"), Ok(TYPE_JAVA));
+    assert_eq!(member_type(b"bpf"), Err(-EINVAL));
+    assert_eq!(member_type(b"Java"), Err(-EINVAL));
+}
+
+#[test]
+fn init_event_tells_java_from_bpf() {
+    let p = PAYLOAD.to_bytes();
+    let (cert, root) = ([0u8; 32], [0u8; 32]);
+    let (mut set_digest, mut bpf_event, mut java_event) = ([0u8; 32], [0u8; 32], [0u8; 32]);
+    let mut set = Vec::new();
+
+    set_add(&mut set, 1, b"a", p, TYPE_BPF).unwrap();
+    assert_eq!(
+        crate::util::chain::init_event(&cert, &mut set, &root, &mut set_digest, &mut bpf_event,),
+        0
+    );
+    set[0].ty = TYPE_JAVA;
+    assert_eq!(
+        crate::util::chain::init_event(&cert, &mut set, &root, &mut set_digest, &mut java_event,),
+        0
+    );
+    assert_ne!(bpf_event, java_event);
+    assert_eq!(
+        set_digest,
+        crate::util::crypto_openssl::sha256(&[&b"java "[..], p, b" a\n"].concat()).unwrap()
+    );
 }
 
 #[test]

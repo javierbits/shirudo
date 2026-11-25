@@ -12,7 +12,7 @@ use crate::errno::{EINVAL, ENOENT};
 use crate::text::cstr;
 use crate::util::hex::hex_decode;
 use crate::util::json::{JsonField, parse_schema};
-use crate::util::upatch::{NAME_MAX, PAYLOAD_HASH_LEN, member_valid};
+use crate::util::upatch::{NAME_MAX, PAYLOAD_HASH_LEN, TYPE_BPF, TYPE_JAVA, member_valid};
 
 const NAME_LEN: usize = 34;
 const NV_RSA_BYTES: usize = 384;
@@ -21,6 +21,62 @@ const NV_RSA_BYTES: usize = 384;
 pub(crate) const UPATCH_INIT: c_int = 0;
 pub(crate) const UPATCH_LOAD: c_int = 1;
 pub(crate) const UPATCH_UNLOAD: c_int = 2;
+
+struct UpatchRecord {
+    record: &'static [u8],
+    kind: &'static [u8],
+    ty: u32,
+    load: bool,
+}
+
+const UPATCH_RECORDS: [UpatchRecord; 4] = [
+    UpatchRecord {
+        record: b"upatch_load",
+        kind: b"load",
+        ty: TYPE_BPF,
+        load: true,
+    },
+    UpatchRecord {
+        record: b"upatch_unload",
+        kind: b"unload",
+        ty: TYPE_BPF,
+        load: false,
+    },
+    UpatchRecord {
+        record: b"java_load",
+        kind: b"java-load",
+        ty: TYPE_JAVA,
+        load: true,
+    },
+    UpatchRecord {
+        record: b"java_unload",
+        kind: b"java-unload",
+        ty: TYPE_JAVA,
+        load: false,
+    },
+];
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub(crate) fn upatch_record(ty: u32, load: bool) -> Option<&'static [u8]> {
+    UPATCH_RECORDS
+        .iter()
+        .find(|r| r.ty == ty && r.load == load)
+        .map(|r| r.record)
+}
+
+pub(crate) fn upatch_record_parse(record: &[u8]) -> Option<(u32, bool)> {
+    UPATCH_RECORDS
+        .iter()
+        .find(|r| r.record == record)
+        .map(|r| (r.ty, r.load))
+}
+
+pub(crate) fn upatch_kind_parse(kind: &[u8]) -> Option<(u32, bool)> {
+    UPATCH_RECORDS
+        .iter()
+        .find(|r| r.kind == kind)
+        .map(|r| (r.ty, r.load))
+}
 
 /// What the walk of this boot's lines calls with each.
 pub(crate) type LineFn<'a> = &'a mut dyn FnMut(&CStr) -> c_int;
@@ -337,17 +393,12 @@ fn upatches_line(u: &mut UpatchSink<'_>, line: &CStr, is_init: bool) -> c_int {
     if is_init {
         return 0;
     }
-    let t = cstr(&u.ty);
-    if t != b"upatch_load" && t != b"upatch_unload" {
+    let Some((_, load)) = upatch_record_parse(cstr(&u.ty)) else {
         return 0;
-    }
+    };
     if !f[2].seen() || !member_valid(cstr(&u.name), cstr(&u.payload_hex)) {
         return -EINVAL;
     }
-    let event = if t[7] == b'l' {
-        UPATCH_LOAD
-    } else {
-        UPATCH_UNLOAD
-    };
+    let event = if load { UPATCH_LOAD } else { UPATCH_UNLOAD };
     notify(u, event)
 }

@@ -23,7 +23,7 @@ use crate::util::json::JsonEmit;
 use crate::util::keys;
 use crate::util::measured::{MeasuredSet, upatch_of};
 use crate::util::seal;
-use crate::util::upatch::Upatch;
+use crate::util::upatch::{TYPE_JAVA, Upatch};
 use crate::util::upatch_pins::loaded_pins;
 use crate::util::upatch_resolve;
 use crate::util::upatch_verify::links_complete;
@@ -256,6 +256,9 @@ fn append_init_event(
         e.obj_open();
         e.kv_string(b"name", cstr(&m.name));
         e.kv_string(b"payload_sha256", cstr(&m.payload_hex));
+        if m.ty == TYPE_JAVA {
+            e.kv_string(b"type", b"java");
+        }
         e.obj_close();
     }
     e.arr_close();

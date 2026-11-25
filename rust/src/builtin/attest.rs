@@ -22,7 +22,7 @@ use crate::util::chain::{
 };
 use crate::util::config_measure::pcr_valid;
 use crate::util::crypto_openssl::sha256_into;
-use crate::util::eventlog::NV_INDEX;
+use crate::util::eventlog::{self, NV_INDEX};
 use crate::util::help::{
     Help, HelpItem, HelpSection, is_help, is_list_cmds, print_help, print_subcmd_list,
     resolve_subcommand,
@@ -39,7 +39,7 @@ use crate::util::options::{
 use crate::util::seal;
 use crate::util::tpm::REGISTER_ATTRS;
 use crate::util::tpm_wire::{NAME_LEN, NV_RSA_BYTES, RegisterPolicy, nv_name, register_policy};
-use crate::util::upatch::Upatch;
+use crate::util::upatch::{TYPE_BPF, TYPE_JAVA, Upatch};
 
 const MEMBERS_MAX: usize = 256;
 const REPORT_MAX: usize = 8192;
@@ -159,7 +159,7 @@ static VERIFY_OPTS: [OptSpec; 18] = [
         c"--expect",
         0,
         OPT_REPEAT,
-        Some(c"<name>=<hex>"),
+        Some(c"[java:]<name>=<hex>"),
         c"an installed upatch by name and payload digest",
     ),
     OptSpec::new(
@@ -328,7 +328,7 @@ static PREDICT_OPTS: [OptSpec; 8] = [
         c"--expect",
         0,
         OPT_REPEAT,
-        Some(c"<name>=<hex>"),
+        Some(c"[java:]<name>=<hex>"),
         c"an installed upatch by name and payload digest",
     ),
     OptSpec::new(
@@ -343,7 +343,7 @@ static PREDICT_OPTS: [OptSpec; 8] = [
         0,
         OPT_REPEAT,
         Some(c"<kind>:<name>=<hex>"),
-        c"a load, unload, tree:<seq> or revoke:<fingerprint> event after boot",
+        c"a load, unload, java-load, java-unload, tree:<seq> or revoke:<fingerprint> event after boot",
     ),
     OptSpec::new(
         c"--bind-pcr",
@@ -475,8 +475,8 @@ impl Members {
         &mut self.0
     }
 
-    fn add(&mut self, name: &[u8], payload_hex: &[u8]) -> Result<(), c_int> {
-        set_add(&mut self.0, MEMBERS_MAX, name, payload_hex)
+    fn add(&mut self, name: &[u8], payload_hex: &[u8], ty: u32) -> Result<(), c_int> {
+        set_add(&mut self.0, MEMBERS_MAX, name, payload_hex, ty)
     }
 
     fn add_file(&mut self, path: &[u8]) -> Result<(), c_int> {
@@ -487,7 +487,7 @@ impl Members {
                 return Err(EXIT_USAGE);
             }
         };
-        if let Err(ret) = self.add(cstr(&e.name), cstr(&e.payload_hex)) {
+        if let Err(ret) = self.add(cstr(&e.name), cstr(&e.payload_hex), e.ty) {
             let why: &[u8] = if ret == -EEXIST {
                 b"a second upatch of that name"
             } else {
@@ -500,8 +500,12 @@ impl Members {
     }
 
     fn add_spec(&mut self, spec: &[u8]) -> Result<(), c_int> {
-        let added = parse_name_digest(spec)
-            .and_then(|(name, payload)| self.add(name, &hex::encode(&payload)));
+        let (ty, rest) = match spec.strip_prefix(b"java:") {
+            Some(rest) => (TYPE_JAVA, rest),
+            None => (TYPE_BPF, spec),
+        };
+        let added = parse_name_digest(rest)
+            .and_then(|(name, payload)| self.add(name, &hex::encode(&payload), ty));
         if let Err(ret) = added {
             let why: &[u8] = if ret == -EEXIST {
                 b"a second upatch of that name"
@@ -556,19 +560,22 @@ fn apply_event(spec: &[u8], register: &mut [u8; 32]) -> Result<(), c_int> {
     let (name, digest) = parse_name_digest(rest)?;
     let mut event = [0u8; 32];
 
-    let ret = match kind {
-        b"load" => chain::upatch_event(c"shirudo-upatch", name, &digest, &mut event),
-        b"unload" => chain::upatch_event(c"shirudo-unload", name, &digest, &mut event),
-        b"tree" => {
-            let seq = parse_u64(name, i64::MAX as u64)
-                .ok()
-                .and_then(|s| i64::try_from(s).ok())
-                .filter(|&s| s >= 1)
-                .ok_or(-EINVAL)?;
-            chain::tree_event(seq, &digest, &mut event)
+    let ret = if let Some((ty, load)) = eventlog::upatch_kind_parse(kind) {
+        let tag = chain::upatch_tag(ty, load).ok_or(-EINVAL)?;
+        chain::upatch_event(tag, name, &digest, &mut event)
+    } else {
+        match kind {
+            b"tree" => {
+                let seq = parse_u64(name, i64::MAX as u64)
+                    .ok()
+                    .and_then(|s| i64::try_from(s).ok())
+                    .filter(|&s| s >= 1)
+                    .ok_or(-EINVAL)?;
+                chain::tree_event(seq, &digest, &mut event)
+            }
+            b"revoke" => chain::key_event(c"shirudo-key-revoke", &digest, &mut event),
+            _ => return Err(-EINVAL),
         }
-        b"revoke" => chain::key_event(c"shirudo-key-revoke", &digest, &mut event),
-        _ => return Err(-EINVAL),
     };
     if ret != 0 || chain::fold(register, &event) != 0 {
         return Err(-EIO);

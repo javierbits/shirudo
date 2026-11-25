@@ -12,6 +12,7 @@
 //!   test-register writer-create|writer-remove|writer-public|read|status
 //!   test-register init <event hex>
 //!   test-register load <upatch> <payload hex>
+//!   test-register java-load <upatch> <payload hex>
 //!   test-register tree <seq> <op> <id> sha256:<hex>
 //!   test-register extend-raw <event hex>
 //!   test-register pcr <pcr> | pcr-extend <pcr> <digest hex>
@@ -37,6 +38,7 @@ use crate::util::json::JsonEmit;
 use crate::util::nv_writer;
 use crate::util::tpm::{Attestation, Branches, KeyPublic, NvInfo, Tpm};
 use crate::util::tpm_wire::{NV_RSA_BYTES, RegisterPolicy, register_policy};
+use crate::util::upatch::{TYPE_BPF, TYPE_JAVA};
 
 helper_main!(shirudo_helper_test_register, run);
 
@@ -211,18 +213,24 @@ fn extend(event: &[u8; 32], record: Option<Record<'_>>) -> c_int {
     }
 }
 
-fn load(name: &CStr, payload_hex: &CStr) -> c_int {
+fn load(name: &CStr, payload_hex: &CStr, ty: u32) -> c_int {
     let Some(payload) = digest(payload_hex) else {
         return 2;
     };
     let mut event = [0u8; 32];
-    if chain::upatch_event(c"shirudo-upatch", name.to_bytes(), &payload, &mut event) != 0 {
+    let (Some(tag), Some(record)) = (
+        chain::upatch_tag(ty, true),
+        eventlog::upatch_record(ty, true),
+    ) else {
+        return 1;
+    };
+    if chain::upatch_event(tag, name.to_bytes(), &payload, &mut event) != 0 {
         return 1;
     }
     extend(
         &event,
         Some(&|e: &mut JsonEmit, chain: &[u8; 32]| {
-            record_head(e, NV_INDEX, &event, b"upatch_load");
+            record_head(e, NV_INDEX, &event, record);
             e.obj_open_key(b"upatch");
             e.kv_string(b"name", name.to_bytes());
             e.kv_string(b"payload_sha256", &encode(&payload));
@@ -657,7 +665,8 @@ fn run(args: &[&CStr]) -> c_int {
             Some(event) => print_init(&event),
             None => 2,
         },
-        (b"load", 4) => load(args[2], args[3]),
+        (b"load", 4) => load(args[2], args[3], TYPE_BPF),
+        (b"java-load", 4) => load(args[2], args[3], TYPE_JAVA),
         (b"tree", 6) => tree(args),
         (b"extend-raw", 3) => match digest(args[2]) {
             Some(event) => extend(&event, None),

@@ -768,11 +768,14 @@ fn on_record(p: &mut Parse) -> Result<(), c_int> {
             // This boot's register starts here.
             p.recs.clear();
         }
-        b"upatch_load" => derive_upatch(p, c"shirudo-upatch", &mut r)?,
-        b"upatch_unload" => derive_upatch(p, c"shirudo-unload", &mut r)?,
         b"tree_op" => derive_tree_op(p, &mut r),
         b"key_revoke" => derive_key_revoke(p, &mut r),
-        _ => {}
+        _ => {
+            if let Some((payload_type, load)) = eventlog::upatch_record_parse(&ty) {
+                let tag = chain::upatch_tag(payload_type, load).ok_or(-EINVAL)?;
+                derive_upatch(p, tag, &mut r)?;
+            }
+        }
     }
     p.recs.push(r);
     // Reset the per-element scratch the next element may not set.

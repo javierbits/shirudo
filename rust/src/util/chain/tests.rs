@@ -70,6 +70,43 @@ fn chain_events_hash_their_documented_input() {
 }
 
 #[test]
+fn upatch_tags_are_distinct() {
+    let tags = [
+        upatch_tag(TYPE_BPF, true),
+        upatch_tag(TYPE_BPF, false),
+        upatch_tag(TYPE_JAVA, true),
+        upatch_tag(TYPE_JAVA, false),
+    ]
+    .map(|tag| tag.map(CStr::to_bytes));
+
+    assert_eq!(
+        tags,
+        [
+            Some(&b"shirudo-upatch"[..]),
+            Some(&b"shirudo-unload"[..]),
+            Some(&b"shirudo-java"[..]),
+            Some(&b"shirudo-java-unload"[..]),
+        ]
+    );
+    assert!(upatch_tag(3, true).is_none());
+}
+
+#[test]
+fn java_unload_event_hashes_its_documented_input() {
+    let payload = [0x3cu8; 32];
+    let mut name = [b'n'; NAME_MAX + 1];
+    let mut event = [0u8; 32];
+
+    name[NAME_MAX] = 0;
+    let tag = upatch_tag(TYPE_JAVA, false).unwrap();
+    assert_eq!(upatch_event(tag, &name, &payload, &mut event), 0);
+    assert_eq!(
+        event,
+        sha256(&[tag.to_bytes_with_nul(), &payload, &name[..NAME_MAX]].concat())
+    );
+}
+
+#[test]
 fn chain_fold_extends_like_the_register() {
     let mut chain = [0u8; 32];
     let event = [0x5au8; 32];
