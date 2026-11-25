@@ -442,6 +442,26 @@ fn build_upatches(
         }
         spec.upatches[i].load_path = load.clone();
         spec.upatches[i].unload_path = unload.clone();
+        let Ok(name) = upatch_name(&source) else {
+            return Err(-ENAMETOOLONG);
+        };
+        if spec.upatches[i].ty == b"java" {
+            package::java_load(
+                &cstring(&source),
+                &cstring(&load),
+                &cstring(&name),
+                (&keys.pkey, &keys.cert),
+            )?;
+            record_payload(spec, i, &load, false)?;
+            let u = &spec.upatches[i];
+            package::java_unload(
+                &cstring(&u.name),
+                &digest_of(&u.payload_sha256),
+                &cstring(&unload),
+                (&keys.pkey, &keys.cert),
+            )?;
+            continue;
+        }
         let object = [&load[..], b".bpf.o"].concat();
         let (bpf_o, src_path) = if name_has_suffix(&source, b".bpf.c") {
             if vmlinux_h.is_none() {
@@ -483,9 +503,6 @@ fn build_upatches(
             return Err(-EINVAL);
         } else {
             (source.clone(), None)
-        };
-        let Ok(name) = upatch_name(&source) else {
-            return Err(-ENAMETOOLONG);
         };
         let (labels, nr) = policy_labels(&spec.upatches[i]);
         let ret = package::load(
@@ -544,7 +561,7 @@ pub(super) fn record_payload(
     let up = &mut spec.upatches[i];
     up.name = u.name().to_vec();
     up.payload_sha256 = hex(&u.hdr.payload_sha256);
-    up.ty = b"bpf".to_vec();
+    up.ty = u.payload_type().to_vec();
     Ok(())
 }
 

@@ -476,12 +476,21 @@ fn staged(
         u.load_path = load;
         u.unload_path = unload.clone();
         let digest = build::digest_of(&u.payload_sha256);
-        package::unload(
-            &cstring(&u.name),
-            &digest,
-            &cstring(&unload),
-            (&keys.pkey, &keys.cert),
-        )?;
+        if u.ty == b"java" {
+            package::java_unload(
+                &cstring(&u.name),
+                &digest,
+                &cstring(&unload),
+                (&keys.pkey, &keys.cert),
+            )?;
+        } else {
+            package::unload(
+                &cstring(&u.name),
+                &digest,
+                &cstring(&unload),
+                (&keys.pkey, &keys.cert),
+            )?;
+        }
     }
     archive::write(
         "bpm config update",

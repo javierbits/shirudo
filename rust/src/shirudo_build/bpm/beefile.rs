@@ -9,7 +9,7 @@
 use core::ffi::c_int;
 
 use crate::errno::{E2BIG, EINVAL, ENAMETOOLONG};
-use crate::text::{cstr, parse_x64};
+use crate::text::{cstr, name_has_suffix, parse_x64};
 use crate::util::bpm_tree::{MAX_VALUES, STRING_MAX, SelectorMap, TreeSelector};
 use crate::util::upatch;
 
@@ -691,7 +691,12 @@ fn finish(spec: &mut Spec) -> Result<(), c_int> {
             u.ty = b"bpf".to_vec();
         }
         u.ty.make_ascii_lowercase();
-        if u.ty != b"bpf" || default_targets(u).is_err() {
+        let type_ok = u.ty == b"bpf"
+            || (u.ty == b"java"
+                && name_has_suffix(&u.source, b".jar")
+                && u.rodata.is_empty()
+                && u.policies.is_empty());
+        if !type_ok || default_targets(u).is_err() {
             return Err(-EINVAL);
         }
         for r in &u.rodata {
