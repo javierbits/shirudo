@@ -6,11 +6,11 @@
 //! listing them.
 
 use core::ffi::{CStr, c_int};
-use std::ffi::{CString, OsStr};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 
 use super::fetch::{self, sha256_file};
@@ -89,25 +89,23 @@ fn remove_tree(path: &CStr) -> Result {
     fs::remove_dir_all(os(path)).map_err(os_err)
 }
 
-/// The paths of the upatches of `kind` in `dir`, in the file system's
-/// order, at most PATHS_MAX.
-fn members(dir: &CStr, kind: UpatchMember) -> Result<Vec<(CString, Vec<u8>)>> {
-    let mut found = Vec::new();
-
-    for entry in fs::read_dir(os(dir))
-        .map_err(os_err)?
+fn member_names(entries: fs::ReadDir, kind: UpatchMember) -> impl Iterator<Item = OsString> {
+    entries
         .map_while(core::result::Result::ok)
-    {
-        let name = entry.file_name();
-        let name = name.as_bytes();
+        .map(|entry| entry.file_name())
+        .filter(move |name| upatch_member(name.as_bytes()) == kind)
+}
 
-        if upatch_member(name) != kind {
-            continue;
-        }
-        let member = path(&[dir.to_bytes(), b"/", name])?;
-        found.push((member, name.to_vec()));
-    }
-    Ok(found)
+/// The paths and names of the upatches of one kind in the directory.
+fn members(dir: &CStr, kind: UpatchMember) -> Result<Vec<(CString, Vec<u8>)>> {
+    let entries = fs::read_dir(os(dir)).map_err(os_err)?;
+
+    member_names(entries, kind)
+        .map(|name| {
+            let path = path(&[dir.to_bytes(), b"/", name.as_bytes()])?;
+            Ok((path, name.into_vec()))
+        })
+        .collect()
 }
 
 /// The upatches a package loads: regular files, in name order.
@@ -136,18 +134,28 @@ fn loads(package_dir: &CStr) -> Result<Vec<CString>> {
 /// the load it undoes, in reverse name order, as uninstall runs them.
 fn old_pairs(old: &[u8]) -> Result<Vec<(CString, CString)>> {
     let olddir = path(&[old, b"/upatches"])?;
+    let Ok(entries) = fs::read_dir(os(&olddir)) else {
+        return Ok(Vec::new());
+    };
+    collect_old_pairs(&olddir, member_names(entries, UpatchMember::Unload))
+}
+
+fn collect_old_pairs(
+    olddir: &CStr,
+    names: impl Iterator<Item = OsString>,
+) -> Result<Vec<(CString, CString)>> {
     let mut pairs = Vec::new();
 
-    for (unload, name) in members(&olddir, UpatchMember::Unload).unwrap_or_default() {
+    for name in names.take(PATHS_MAX) {
+        let name = name.as_bytes();
         let mut load = [0u8; 256];
 
-        if pairs.len() >= PATHS_MAX {
-            continue;
-        }
-        if upatch_pair(&name, &mut load) != 0 {
+        if upatch_pair(name, &mut load) != 0 {
             return Err(-ENAMETOOLONG);
         }
-        pairs.push((unload, path(&[olddir.to_bytes(), b"/", cstr(&load)])?));
+        let unload = path(&[olddir.to_bytes(), b"/", name])?;
+        let load = path(&[olddir.to_bytes(), b"/", cstr(&load)])?;
+        pairs.push((unload, load));
     }
     pairs.sort_by(|a, b| b.0.cmp(&a.0));
     Ok(pairs)
@@ -604,3 +612,6 @@ pub(super) fn uninstall(name: &[u8]) -> c_int {
     });
     finish(Some(held), ret, b"uninstall")
 }
+
+#[cfg(test)]
+mod tests;
